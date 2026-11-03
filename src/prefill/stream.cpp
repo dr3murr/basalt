@@ -26,7 +26,8 @@ bool Prefill::Run::Chunk::start_stream() {
                 if (ppc && ppc->peer && ppc->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                 int job = -1;
                 const uint8_t* b = nullptr;
-                if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {   // no host copy: from the peer
+                if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e) &&
+                    (!m.ring_peer->pascal() || peer_link_pick(l, e))) {   // no host copy: from the peer
                     seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e)});
                     continue;
                 }
