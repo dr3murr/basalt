@@ -19,6 +19,7 @@
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -37,6 +38,10 @@ bool Verifier::dm_init(std::string& err) {
     else if (all_resident_) why = "every expert is resident";
     else if (hits_.h_res == nullptr) why = "no host residency table";
     else if ((int64_t) max_t_ * ss_->k > kDmCap) why = "the window is too large";
+    else if (std::getenv("BASALT_TMP_NO_DM") != nullptr) why = "BASALT_TMP_NO_DM";
+    else if ((peer_ != nullptr && peer_->pascal()) ||
+             std::any_of(xpeers_.begin(), xpeers_.end(), [](const PeerExperts* p) { return p != nullptr && p->pascal(); }))
+        why = "an expert tier is a Pascal card (its rows take the pool path)";
     for (int64_t l = 0; why == nullptr && l < g.n_layers; ++l) {
         const auto& f = lay.fmt[(size_t) l];
         if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) why = "an expert format the kernels do not cover";

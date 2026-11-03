@@ -332,6 +332,34 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
+# The Pascal (sm_60) expert tier: its kernels come from a CUDA 12 nvcc (CUDA 13 compiles nothing older than sm_75)
+# into a cubin embedded here and loaded through the driver API on that card (include/basalt/core/pascal_peer.hpp).
+set(BASALT_PASCAL_NVCC "" CACHE FILEPATH "a CUDA 12.x nvcc: builds the Pascal (sm_60) expert tier's kernels")
+set(BASALT_PASCAL_CCBIN "" CACHE FILEPATH "the host compiler for BASALT_PASCAL_NVCC (empty: its default)")
+target_sources(engine PRIVATE src/core/pascal_peer.cpp)
+target_include_directories(engine PRIVATE ${_gpu_include_directories})
+if(BASALT_PASCAL_NVCC)
+  set(_pascal_cubin ${CMAKE_CURRENT_BINARY_DIR}/pascal_peer_sm60.cubin)
+  set(_pascal_embed ${CMAKE_CURRENT_BINARY_DIR}/pascal_peer_cubin.cpp)
+  set(_pascal_ccbin)
+  if(BASALT_PASCAL_CCBIN)
+    set(_pascal_ccbin -ccbin ${BASALT_PASCAL_CCBIN})
+  endif()
+  add_custom_command(OUTPUT ${_pascal_cubin}
+    COMMAND ${BASALT_PASCAL_NVCC} ${_pascal_ccbin} -Wno-deprecated-gpu-targets -std=c++17 -O3 -cubin -arch=sm_60
+            -I${CMAKE_CURRENT_SOURCE_DIR}/include -o ${_pascal_cubin}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/pascal/peer_experts_sm60.cu
+    DEPENDS src/kernels/pascal/peer_experts_sm60.cu include/basalt/kernels/pascal_peer.hpp
+            include/basalt/ggml/ggml_common.h
+    COMMENT "Pascal expert tier kernels (sm_60 cubin)")
+  add_custom_command(OUTPUT ${_pascal_embed}
+    COMMAND ${CMAKE_COMMAND} -DIN=${_pascal_cubin} -DOUT=${_pascal_embed} -DNAME=basalt_pascal_cubin
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cubin.cmake
+    DEPENDS ${_pascal_cubin} cmake/embed_cubin.cmake)
+  target_sources(engine PRIVATE ${_pascal_embed})
+  target_compile_definitions(engine PRIVATE BASALT_PASCAL_PEER=1)
+  message(STATUS "basalt: Pascal expert tier kernels from ${BASALT_PASCAL_NVCC}")
+endif()
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
   target_link_libraries(file_expert_source_test PRIVATE engine)

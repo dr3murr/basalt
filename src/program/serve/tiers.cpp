@@ -131,8 +131,11 @@ void Runtime::apply_pending(bool wait, bool exchanges) {
     pending_spare.clear();
     pending.clear();
     res_upload();
-    // a promoted expert is CUDA0's now: its peer slot takes the expert CUDA0 gave up (in RAM since the commit)
+    // a promoted expert is CUDA0's now: its peer slot takes the expert CUDA0 gave up (in RAM since the commit).  Not
+    // on a Pascal tier: a copy over its link delays the layers' rows behind it, so the given-up expert stays a CPU
+    // row and the slot keeps its (now duplicate) expert.
     for (const auto& p : promoted) {
+        if (peer.pascal()) break;
         std::string perr;
         if (!peer.reassign(p[0], p[1], p[0], p[2], srcp->blob(p[0], p[2]), perr))
             basalt::log::warn("basalt serve", "%s", perr.c_str());
@@ -592,6 +595,7 @@ int Runtime::init_tiers() {
     // window's gate/up launches wait for their own layer's incoming copies (the landed words below), so the loop
     // does not, and where an expert runs depends only on the window count, as with the plain rounds.
     adapt_fast = !multi_gpu && !remote_opt;
+    promote_margin = peer.valid() && peer.pascal() ? 0.0f : 10.0f;
     // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
     // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
     // margin.

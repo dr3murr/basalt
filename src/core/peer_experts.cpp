@@ -29,6 +29,7 @@ constexpr int64_t H = basalt::kernels::cpu::H;
 constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
 
 struct Meta {                           // one block, uploaded with one copy per layer
+    basalt::kernels::pascal::Group grp[CAP];   // a Pascal tier's groups (at most kGroupEntries entries each)
     unsigned long long ptr[CAP];
     int32_t start[CAP + 1];
     int32_t dst[CAP];
@@ -67,6 +68,8 @@ void PeerExperts::close() {
         if (d_meta_) cudaFree(d_meta_);
         if (d_q8_) cudaFree(d_q8_);
         if (d_scratch_) cudaFree(d_scratch_);
+        for (void* p : {d_y_, d_ys_, (void*) d_h_, d_hy_, d_hys_})
+            if (p) cudaFree(p);
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
@@ -78,6 +81,9 @@ void PeerExperts::close() {
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
+    d_y_ = d_ys_ = d_hy_ = d_hys_ = nullptr;
+    d_h_ = nullptr;
+    pas_.reset();
     stream_ = refill_ = nullptr;
     refill_ev_ = evict_ev_ = nullptr;
     fsrc_ = nullptr;
@@ -150,7 +156,23 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
     On on(device);
     device_ = device;
     // scratch first, so the slots take what is really left
-    const size_t scratch = scratch_bytes();
+    const bool pascal = is_pascal_device(device);
+    if (pascal) {
+        pas_ = std::make_unique<PascalKernels>();
+        if (!pas_->load(device, err)) { close(); return false; }
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        if (!lay.native) { err = "pascal tier: only native packs are supported"; close(); return false; }
+        for (const auto& f : lay.fmt)
+            if (!pas_->supports(f.gu_type, f.d_type)) {
+                err = "pascal tier: no Pascal kernels for gate/up type " + std::to_string(f.gu_type) +
+                      " with down type " + std::to_string(f.d_type);
+                close();
+                return false;
+            }
+    }
+    int64_t ff = basalt::kernels::cpu::FF;
+    for (const auto& f : basalt::kernels::cpu::expert_layout().fmt) ff = std::max<int64_t>(ff, f.n_ff);
+    const size_t scratch = pascal ? 0 : scratch_bytes();
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
@@ -162,8 +184,13 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
         ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
-        ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
+        (pascal ? ck(cudaMalloc(&d_y_, (size_t) CAP * H * 2), "activations", err) &&
+                      ck(cudaMalloc(&d_ys_, (size_t) CAP * (H / 32) * 8), "activation scales", err) &&
+                      ck(cudaMalloc((void**) &d_h_, (size_t) CAP * ff * sizeof(float)), "swiglu rows", err) &&
+                      ck(cudaMalloc(&d_hy_, (size_t) CAP * ff * 2), "swiglu activations", err) &&
+                      ck(cudaMalloc(&d_hys_, (size_t) CAP * (ff / 32) * 8), "swiglu scales", err)
+                : ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
+                      ck(cudaMalloc(&d_scratch_, scratch), "scratch", err));
     if (!alloc_ok) { close(); return false; }
     return true;
 }
@@ -217,11 +244,43 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
         return false;
     }
     resident_ = (int64_t) pick.size();
+    if (pas_ && std::getenv("BASALT_TMP_PASCAL_SELFTEST") != nullptr) {   // TMP_PASCAL_DEBUG
+        Meta& m = *(Meta*) h_meta_;
+        const int32_t slot0 = res_[(size_t) (f0.first * n_expert + f0.second)];
+        m.grp[0] = {(unsigned long long) cache_.device_slot(slot0), 0u | (1u << 16), 0u};
+        m.out_row[0] = 0;
+        const auto& f = lay.fmt[(size_t) f0.first];
+        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        std::string e2;
+        const bool ok = ck(cudaMemsetAsync(d_x_, 0, (size_t) H * sizeof(float), stream_), "x", e2) &&
+                        ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, stream_), "meta", e2);
+        basalt::kernels::pascal::LayerArgs a{};
+        a.grp = ((Meta*) d_meta_)->grp; a.out_row = ((Meta*) d_meta_)->out_row; a.x = d_x_; a.y = d_y_; a.ys = d_ys_;
+        a.h = d_h_; a.hy = d_hy_; a.hys = d_hys_; a.out = d_out_; a.host_out = nullptr;
+        a.gu_row = (long long) L.gu_row; a.d_row = (long long) L.d_row; a.up_off = (long long) L.up_off;
+        a.down_off = (long long) L.down_off; a.groups = 1; a.entries = 1; a.n_tok = std::getenv("BASALT_TMP_NTOK0") ? 0 : 1; a.n_embd = (int32_t) f.n_embd;
+        a.n_ff = (int32_t) f.n_ff;
+        unsigned long long* tst = nullptr;
+        (void) cudaHostAlloc((void**) &tst, 4096, cudaHostAllocPortable | cudaHostAllocMapped);
+        std::memset(tst, 0, 4096);
+        a.stamps = tst;
+        const bool ok2 = ok && pas_->layer(f.gu_type, f.d_type, a, stream_, e2);
+        const cudaError_t se = cudaStreamSynchronize(stream_);
+        basalt::log::info("basalt", "TMP pascal self-test layer %d types %d/%d: launch %s, sync %s %s", f0.first, f.gu_type,
+                          f.d_type, ok2 ? "ok" : "failed", cudaGetErrorString(se), e2.c_str());
+        std::string prog;
+        for (int b = 0; b < 56; ++b) prog += std::to_string(tst[8 + b]);
+        basalt::log::info("basalt", "TMP pascal self-test phases %s; bar %p x %p", prog.c_str(), pas_->tmp_bar(), (void*) d_x_);
+    }
     return true;
 }
 
+static std::chrono::steady_clock::time_point g_tmp_l0, g_tmp_l1, g_tmp_la, g_tmp_lb;   // TMP_PEER_STATS
+
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
+    g_tmp_l0 = std::chrono::steady_clock::now();
+    struct TmpEnd { ~TmpEnd() { g_tmp_l1 = std::chrono::steady_clock::now(); } } tmp_end;   // TMP_PEER_STATS
     const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_rows_ = 0;
@@ -229,7 +288,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     const int64_t n = n_tok * k;
     if (n > CAP) { err = "peer experts: window too large"; return false; }
     Meta& m = *(Meta*) h_meta_;
-    int groups = 0, rows = 0;
+    int groups = 0, rows = 0, pgroups = 0;
     // distinct experts in routing order; each one's entries become compact rows
     for (int64_t i = 0; i < n; ++i) {
         if (kind[i] != 2) continue;
@@ -249,6 +308,13 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
                 row_of_.push_back((int32_t) j);
                 ++rows;
             }
+        if (pas_)   // the Pascal kernels' groups: at most kGroupEntries entries of the expert each
+            for (int r0 = m.start[groups]; r0 < rows; r0 += basalt::kernels::pascal::kGroupEntries) {
+                const int c = std::min<int>(basalt::kernels::pascal::kGroupEntries, rows - r0);
+                uint32_t toks = 0;
+                for (int q = 0; q < c; ++q) toks |= (uint32_t) m.tok[r0 + q] << (8 * q);
+                m.grp[pgroups++] = {m.ptr[groups], (uint32_t) r0 | ((uint32_t) c << 16), toks};
+            }
         ++groups;
         ++experts_;
     }
@@ -265,20 +331,113 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
+    g_tmp_la = std::chrono::steady_clock::now();   // TMP_PEER_STATS
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = basalt::kernels::cpu::expert_layout();
-    if (lay.native) {
-        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
-        const auto& f = lay.fmt[(size_t) layer];
-        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
-        basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
-                                               d_scratch_, d_out_, s);
-        basalt::kernels::native_grouped_set_mma_hint(false);
-    } else {
+    if (!lay.native) {
         err = "peer experts: only native packs are supported";
         return false;
     }
+    const auto& f = lay.fmt[(size_t) layer];
+    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+    if (pas_) {
+        static bool told = false;   // TMP_PASCAL_DEBUG
+        if (!told && direct) {
+            told = true;
+            cudaPointerAttributes pa{};
+            const cudaError_t pe = cudaPointerGetAttributes(&pa, out);
+            basalt::log::info("basalt", "TMP pascal out %p: %s type %d device %d dev ptr %p host ptr %p", (void*) out,
+                              cudaGetErrorString(pe), (int) pa.type, pa.device, pa.devicePointer, pa.hostPointer);
+            cudaGetLastError();
+        }
+        basalt::kernels::pascal::LayerArgs a{};
+        a.grp = dm->grp;
+        a.out_row = dm->out_row;
+        a.x = d_x_;
+        a.y = d_y_;
+        a.ys = d_ys_;
+        a.h = d_h_;
+        a.hy = d_hy_;
+        a.hys = d_hys_;
+        a.out = d_out_;
+        const bool tmp_direct = direct && std::getenv("BASALT_TMP_PASCAL_STAGED") == nullptr;   // TMP_PASCAL_DEBUG
+        a.host_out = tmp_direct ? out : nullptr;   // direct: the rows straight into the host `out` (mapped)
+        a.gu_row = (long long) L.gu_row;
+        a.d_row = (long long) L.d_row;
+        a.up_off = (long long) L.up_off;
+        a.down_off = (long long) L.down_off;
+        a.groups = pgroups;
+        a.entries = rows;
+        a.n_tok = (int32_t) n_tok;
+        a.n_embd = (int32_t) f.n_embd;
+        a.n_ff = (int32_t) f.n_ff;
+        static unsigned long long* tmp_st = nullptr;   // TMP_PASCAL_DEBUG
+        const bool tmp_sync = std::getenv("BASALT_TMP_PASCAL_SYNC") != nullptr;
+        static const bool tmp_stamps = std::getenv("BASALT_TMP_STAMPS") != nullptr;
+        if ((tmp_sync || tmp_stamps) && tmp_st == nullptr)
+            (void) cudaHostAlloc((void**) &tmp_st, 4096, cudaHostAllocPortable | cudaHostAllocMapped);
+        if (tmp_stamps && tmp_st[5] != 0) {   // the previous launch's phases (it has finished: finish() ran)
+            static double ph[5] = {};
+            static long long np = 0;
+            for (int i = 0; i < 5; ++i) ph[i] += (double) (tmp_st[i + 1] - tmp_st[i]) * 1e-3;
+            if (++np % 20000 == 0) {
+                basalt::log::info("basalt", "TMP phases us: prep %.1f gu %.1f hprep %.1f down %.1f scatter %.1f",
+                                  ph[0] / 20000, ph[1] / 20000, ph[2] / 20000, ph[3] / 20000, ph[4] / 20000);
+                for (double& v : ph) v = 0;
+            }
+        }
+        if (tmp_sync || tmp_stamps) { std::memset(tmp_st, 0, 4096); a.stamps = tmp_st; }
+        const auto tq0 = std::chrono::steady_clock::now();   // TMP_PEER_STATS
+        if (!pas_->layer(f.gu_type, f.d_type, a, s, err)) return false;
+        const auto tq1 = std::chrono::steady_clock::now();
+        {
+            static double acc = 0;
+            static long long cnt = 0;
+            acc += std::chrono::duration<double, std::micro>(tq1 - tq0).count();
+            if (++cnt % 20000 == 0) { basalt::log::info("basalt", "TMP layer() call %.1f us", acc / 20000); acc = 0; }
+        }
+        g_tmp_lb = std::chrono::steady_clock::now();   // TMP_PEER_STATS
+        if (tmp_sync) {   // TMP_PASCAL_DEBUG
+            const cudaError_t se = cudaStreamSynchronize(s);
+            if (se != cudaSuccess) {
+                basalt::log::error("basalt", "TMP pascal layer %lld: %s; n_tok %lld k %lld rows %d groups %d pgroups %d types %d/%d stamps %llu %llu %llu %llu %llu %llu",
+                                   (long long) layer, cudaGetErrorString(se), (long long) n_tok, (long long) k, rows, groups,
+                                   pgroups, f.gu_type, f.d_type, tmp_st[0], tmp_st[1], tmp_st[2], tmp_st[3], tmp_st[4], tmp_st[5]);
+                {
+                    std::string prog;
+                    for (int b = 0; b < 56; ++b) prog += std::to_string(tmp_st[8 + b]);
+                    basalt::log::error("basalt", "TMP  block phases: %s", prog.c_str());
+                }
+                const void* ps[] = {a.grp, a.out_row, a.x, a.y, a.ys, a.h, a.hy, a.hys, a.out, pas_->tmp_bar(), a.stamps};
+                for (const void* p : ps) {
+                    cudaPointerAttributes pa{};
+                    const cudaError_t pe = cudaPointerGetAttributes(&pa, p);
+                    basalt::log::error("basalt", "TMP  ptr %p: %s type %d device %d", p, cudaGetErrorString(pe), (int) pa.type, pa.device);
+                }
+                for (int g = 0; g < pgroups; ++g) {
+                    cudaPointerAttributes pa{};
+                    const cudaError_t pe = cudaPointerGetAttributes(&pa, (const void*) m.grp[g].blob);
+                    basalt::log::error("basalt", "TMP  grp %d: blob %llx (%s type %d device %d) first %u count %u toks %08x", g,
+                                       (unsigned long long) m.grp[g].blob, cudaGetErrorString(pe), (int) pa.type, pa.device,
+                                       m.grp[g].first_and_count & 0xffffu, m.grp[g].first_and_count >> 16, m.grp[g].tokens);
+                }
+                err = "pascal debug";
+                return false;
+            }
+        }
+        if (tmp_direct) {
+            launched_direct_ = true;
+            g_tmp_la = std::chrono::steady_clock::now();   // TMP_PEER_STATS: "gap" = return path (~On)
+            return true;
+        }
+        return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
+                  "results", err);
+    }
+    basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+    basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
+    basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+                                           d_scratch_, d_out_, s);
+    basalt::kernels::native_grouped_set_mma_hint(false);
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
             basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
@@ -302,6 +461,21 @@ bool PeerExperts::finish(float* out, std::string& err) {
         if (!ck(e, "finish", err)) return false;
     }
     ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    {   // TMP_PEER_STATS: remove after the Pascal tier measurements
+        static double w_ms = 0, rows_n = 0, grp_n = 0, l_ms = 0, g_ms = 0;
+        static long long n = 0;
+        w_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        l_ms += std::chrono::duration<double, std::milli>(g_tmp_l1 - g_tmp_l0).count();
+        g_ms += std::chrono::duration<double, std::milli>(g_tmp_lb - g_tmp_la).count();   // TMP: now "kernel launch call"
+        rows_n += (double) launched_rows_;
+        grp_n += (double) row_of_.size();
+        if (++n % 20000 == 0) {
+            basalt::log::info("basalt", "TMP peer: %lld launches, launch %.1f us, gap %.1f us, wait %.1f us, %.1f rows per launch",
+                              n, 1e3 * l_ms / 20000, 1e3 * g_ms / 20000, 1e3 * w_ms / 20000, rows_n / 20000);
+            w_ms = rows_n = grp_n = l_ms = g_ms = 0;
+            w_ms = rows_n = grp_n = 0;
+        }
+    }
     if (launched_direct_) { launched_rows_ = 0; return true; }
     for (size_t r = 0; r < row_of_.size(); ++r)
         std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));

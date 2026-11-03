@@ -37,6 +37,9 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err);
 
 /// Whether Basalt runs on the card: compute capability 12.0, or unknown (nothing to check against).
 bool gpu_supported(const GpuCard& c);
+/// Whether the card can be a listed expert tier: a card Basalt runs on, or a Pascal card (compute capability 6.x,
+/// served by the Pascal kernels of a build with BASALT_PASCAL_NVCC).
+bool gpu_tier_supported(const GpuCard& c);
 
 /// "GPU 1 (RTX 5060 Ti)": the visible number the user types, and the name when known.
 std::string gpu_label(const std::vector<GpuCard>& visible, int index);

@@ -277,8 +277,9 @@ private:
     // the VRAM tier follows the conversation
     // the peer's experts are candidates too, so the ones a workload routes most move to
     // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
-    // routings a peer expert needs above CUDA0's victim before it moves
-    static constexpr float promote_margin = 10.0f;
+    // routings a peer expert needs above CUDA0's victim before it moves: 10 with an sm_120 tier (its rows cost about
+    // what CUDA0's do), none with a Pascal tier (its rows sit on the window's critical path, a layer at a time)
+    float promote_margin = 10.0f;
     // the count at which a CPU-tier expert routed about once lately takes a slot the round leaves unused
     static constexpr float once_bar = 1.0f;
     // at most this many of them a round: more copies cost the CPU tier host memory bandwidth on routing that rarely

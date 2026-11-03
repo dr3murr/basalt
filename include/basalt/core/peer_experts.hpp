@@ -17,12 +17,14 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/pascal_peer.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -59,6 +61,8 @@ public:
     static uint64_t device_overhead_bytes();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
+    /// The tier's card is a Pascal card: its rows come from the Pascal kernels, in `launch` only.
+    bool pascal() const { return pas_ != nullptr; }
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
@@ -168,6 +172,10 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    std::unique_ptr<PascalKernels> pas_;              ///< a Pascal card's kernels (null on an sm_120 card)
+    void* d_y_ = nullptr;  void* d_ys_ = nullptr;      // Pascal: the tokens' fp16 activations
+    float* d_h_ = nullptr;                            // Pascal: the entries' SwiGLU rows
+    void* d_hy_ = nullptr; void* d_hys_ = nullptr;     // Pascal: their fp16 activations
 };
 
 }  // namespace basalt::core

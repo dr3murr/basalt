@@ -74,13 +74,22 @@ int run(int argc, char** argv) {
             o.peer_device = -1;
         }
     }
+    // a Pascal expert tier computes decode windows' rows only (its kernels are the pool path's): the prompt chunks'
+    // peer share and the prompt-time split stay on the main card
+    bool pascal_tier = false;
+    for (size_t i = 1; i < chosen_cards.size(); ++i) pascal_tier = pascal_tier || chosen_cards[i].cc_major == 6;
+    if (pascal_tier && o.peer_device >= 1) {
+        if (o.peer_prefill_rows != 0)
+            basalt::log::info("basalt", "pascal tier: decode windows only (no prompt share, no prompt-time split)");
+        o.peer_prefill_rows = 0;
+    }
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
     // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
     // until measured on such a set.  With --batch a read splits only while no slot decodes.
-    bool split_want = o.serve && o.peer_device >= 1;
+    bool split_want = o.serve && o.peer_device >= 1 && !pascal_tier;
     bool split_alike = true;
     for (size_t i = 1; i < chosen_cards.size(); ++i)
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);

@@ -135,6 +135,8 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
 
 bool gpu_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
 
+bool gpu_tier_supported(const GpuCard& c) { return gpu_supported(c) || c.cc_major == 6; }
+
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);
     if (index >= 0 && (size_t) index < visible.size() && !visible[(size_t) index].name.empty())
@@ -204,8 +206,10 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
             c.cards.clear();
             return c;
         }
-        if (known && !gpu_supported(visible[(size_t) i])) {
-            c.error = unsupported(i);
+        // the main card (the first listed) is sm_120; a later one may also be a Pascal card, as an expert tier
+        const bool main = c.cards.empty();
+        if (known && !(main ? gpu_supported(visible[(size_t) i]) : gpu_tier_supported(visible[(size_t) i]))) {
+            c.error = unsupported(i) + (main ? "" : " or a Pascal card (sm_6x, an expert tier)");
             c.cards.clear();
             return c;
         }
