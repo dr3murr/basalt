@@ -504,6 +504,8 @@ bool PeerExperts::finish(float* out, std::string& err) {
 
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
     if (!evicting_.empty() || max_swaps <= 0) return true;
+    // a Pascal card's link is narrow: one round in flight, so its copies never queue behind another's
+    if (pas_ != nullptr && !pending_.empty()) return true;
     // experts whose refill is still landing are not resident yet: they must not be picked again as candidates
     // (their slots belong to no resident expert, so no victim can collide with them)
     std::vector<uint8_t> inflight;

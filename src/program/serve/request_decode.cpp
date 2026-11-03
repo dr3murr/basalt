@@ -167,6 +167,7 @@ Flow Request::decode() {
             runtime_.src.commit_exchanges();
             copy_live = false;
         }
+        runtime_.peer_step();   // a Pascal tier's round in flight: one stage per window (nothing else runs on it now)
         ++adapt_age;
         if (adapt_age >= 2 && !(applied_early && adapt_age == 2)) {
             if (!runtime_.pending.empty()) basalt::core::decode_events().tag(1u << 1);

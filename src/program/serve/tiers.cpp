@@ -80,7 +80,9 @@ void Runtime::res_upload() {
 // the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
 // holds or takes in this round; with one tier r0 is its whole view
 bool Runtime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
-    const int swaps_each = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps;
+    // a Pascal tier's narrow link (a slot behind the chipset) moves a few experts per window: its own default
+    const int swaps_each = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps
+                         : peer.valid() && peer.pascal() ? kPascalPeerSwaps : o.adapt_swaps;
     if (xpeers.empty()) return peer.adapt(drive.d.usage.data(), r0.data(), swaps_each, perr);
     const size_t nt = 1 + xpeers.size();
     auto tier = [&](size_t i) -> basalt::core::PeerExperts& { return i == 0 ? peer : *xpeers[i - 1]; };
@@ -98,6 +100,14 @@ bool Runtime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
         if (!tier(t).adapt(drive.d.usage.data(), seen.data(), swaps_each, perr)) return false;
     }
     return true;
+}
+
+// A Pascal tier's round in flight moves one stage per window, at a fixed window: its evictions landed -> its refills
+// go out; its refills landed -> they are resident.  (Its rounds wait for the last one to land, see PeerExperts::adapt.)
+void Runtime::peer_step() {
+    if (!peer.valid() || !peer.pascal()) return;
+    if (peer_landing) { peer.apply_pending(true); peer_landing = false; }
+    else if (peer.has_pending()) { peer.issue_pending(true); peer_landing = true; }
 }
 
 void Runtime::apply_pending(bool wait, bool exchanges) {
@@ -595,7 +605,7 @@ int Runtime::init_tiers() {
     // window's gate/up launches wait for their own layer's incoming copies (the landed words below), so the loop
     // does not, and where an expert runs depends only on the window count, as with the plain rounds.
     adapt_fast = !multi_gpu && !remote_opt;
-    promote_margin = peer.valid() && peer.pascal() ? 0.0f : 10.0f;
+    promote_margin = 10.0f;
     // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
     // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
     // margin.

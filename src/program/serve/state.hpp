@@ -272,13 +272,16 @@ private:
     std::vector<std::array<int32_t, 3>> promoted{};   // (layer, in, out) of swaps from the peer
     cudaEvent_t adapt_ev{};
     bool peer_landing{};
+    // a Pascal tier's swaps per round when --peer-adapt-swaps is not given: its link is narrow, see adapt_peers
+    // (NVFP4 on a PCIe 3.0 x4 P100, conv/struct/prose tok/s: 2 101/193/98, 4 98/193/97, 8 89/185/84, 16 84/170/83)
+    static constexpr int kPascalPeerSwaps = 2;
     std::vector<uint8_t> xlanding{};
     std::vector<std::pair<int32_t, int32_t>> pending_spare{};   // the RAM places the incoming experts free once resident
     // the VRAM tier follows the conversation
     // the peer's experts are candidates too, so the ones a workload routes most move to
     // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
-    // routings a peer expert needs above CUDA0's victim before it moves: 10 with an sm_120 tier (its rows cost about
-    // what CUDA0's do), none with a Pascal tier (its rows sit on the window's critical path, a layer at a time)
+    // routings a peer expert needs above CUDA0's victim before it moves: 10 for every tier (a Pascal tier too: a
+    // move off it crosses its narrow link, and a smaller margin fills that link with promotions)
     float promote_margin = 10.0f;
     // the count at which a CPU-tier expert routed about once lately takes a slot the round leaves unused
     static constexpr float once_bar = 1.0f;
@@ -519,6 +522,7 @@ private:
     void res_upload();
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
     void apply_pending(bool wait, bool exchanges = true);
+    void peer_step();
     void rank_swaps(std::vector<Swap>& swaps, bool across);
     void rank_once(std::vector<Swap>& swaps, size_t room);
     bool adapt();
