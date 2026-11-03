@@ -80,7 +80,28 @@ __device__ __forceinline__ void iq4_dot(const uint16_t* w, const Cols& Y, float 
 }
 
 // GGML type ids
-constexpr int kIQ3_XXS = 18, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kQ2_0 = 42;
+constexpr int kIQ3_XXS = 18, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kNVFP4 = 40, kQ2_0 = 42;
+
+// NVFP4's UE4M3 sub-block scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0 and 0x7F as 0, bit 7
+// ignored): the same float as the sm_120 kernels' nvfp4_scale_dev.
+__device__ __forceinline__ float nvfp4_scale(uint32_t x) {
+    const uint32_t v = x & 0x7F;
+    if (v == 0 || v == 0x7F) return 0.0f;
+    const uint32_t e = v >> 3, m = v & 7;
+    if (e == 0) return (float) m * (1.0f / 1024.0f);
+    return __uint_as_float(((e + 119) << 23) | (m << 20));
+}
+
+// 4 E2M1 codes (the low nibble of each byte of x; bit 3 the sign) -> two half2 subnormal patterns (doubled magnitude
+// 0,1,2,3,4,6,8,12 times 2^-24, exact): w01 = (code 0, code 1), w23 = (code 2, code 3).
+__device__ __forceinline__ void fp4_pairs(uint32_t x, uint32_t& w01, uint32_t& w23) {
+    constexpr uint32_t T0 = 0x03020100u, T1 = 0x0C080604u;
+    const uint32_t c = x & 0x07070707u;
+    const uint32_t s = c | (c >> 4);                                // byte 0: c0 | c1 << 4, byte 2: c2 | c3 << 4
+    const uint32_t m = prmt(T0, T1, __byte_perm(s, 0, 0x0020));     // selector nibbles c0..c3, all below 8
+    w01 = __byte_perm(m, 0, 0x4140) | ((x & 0x8u) << 12) | ((x & 0x800u) << 20);
+    w23 = __byte_perm(m, 0, 0x4342) | ((x & 0x80000u) >> 4) | ((x & 0x8000000u) << 4);
+}
 
 template <int TY> struct Fmt;
 // UPB: 32-weight units per block; GW: codebook words in shared memory; NS: sign-mask entries
@@ -90,6 +111,7 @@ template <> struct Fmt<kIQ3_S>   { typedef block_iq3_s block;   static constexpr
 template <> struct Fmt<kIQ4_XS>  { typedef block_iq4_xs block;  static constexpr int UPB = 8, GW = 0, NS = 0; };
 template <> struct Fmt<kIQ4_NL>  { typedef block_iq4_nl block;  static constexpr int UPB = 1, GW = 0, NS = 0; };
 template <> struct Fmt<kQ2_0>    { typedef block_q2_0 block;    static constexpr int UPB = 2, GW = 0, NS = 0; };
+template <> struct Fmt<kNVFP4>   { typedef block_nvfp4 block;   static constexpr int UPB = 2, GW = 0, NS = 0; };
 
 // One unit (32 weights: unit j of the block at bb, in shared memory), unpacked once and dotted with each entry's
 // matching 32-block of fp16 activations Y[q]; sc[q] = {rescale, fp32 sum of the block's x}.  Adds each entry's
@@ -169,6 +191,35 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
         }
 #pragma unroll
         for (int q = 0; q < kNE; q++) out[q] += dl * fmaf(s[q], sc[q].x, -128.0f * sc[q].y);
+    } else if constexpr (TY == kNVFP4) {
+        // d[4] (UE4M3) at 0, qs[32] at 4; unit j = sub-blocks 2j and 2j+1, sub-block s's codes at qs[8s .. 8s+8):
+        // byte k holds value k (low nibble) and value k + 8 (high nibble).  One fp16 sum per sub-block (own scale).
+        half2 acc1[kNE];
+#pragma unroll
+        for (int q = 0; q < kNE; q++) acc1[q] = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+#pragma unroll
+            for (int w = 0; w < 2; w++) {
+                const uint32_t qw = u32_at(b16 + 2 + 8 * j + 4 * h + 2 * w);
+                const int i = 8 * h + 2 * w;   // half2 index of value 4w of the sub-block
+                uint32_t lo01, lo23, hi01, hi23;
+                fp4_pairs(qw, lo01, lo23);
+                fp4_pairs(qw >> 4, hi01, hi23);
+                if (h == 0) {
+                    fma_all(lo01, Y, i, acc); fma_all(lo23, Y, i + 1, acc);
+                    fma_all(hi01, Y, i + 4, acc); fma_all(hi23, Y, i + 5, acc);
+                } else {
+                    fma_all(lo01, Y, i, acc1); fma_all(lo23, Y, i + 1, acc1);
+                    fma_all(hi01, Y, i + 4, acc1); fma_all(hi23, Y, i + 5, acc1);
+                }
+            }
+        }
+        const float f0 = nvfp4_scale(bb[2 * j]), f1 = nvfp4_scale(bb[2 * j + 1]);
+#pragma unroll
+        for (int q = 0; q < kNE; q++)
+            out[q] += (f0 * (__low2float(acc[q]) + __high2float(acc[q])) +
+                       f1 * (__low2float(acc1[q]) + __high2float(acc1[q]))) * sc[q].x;
     } else {   // Q2_0: 64 weights per block, code c (2 bits, weight i at bit 2i of qs) means c - 1; unit j = weights 32j..
 #pragma unroll
         for (int h = 0; h < 2; h++) {   // 16 weights per 32-bit word
@@ -363,14 +414,22 @@ __device__ __forceinline__ void mm_phase(const LayerArgs& a, uint32_t* stage, co
 #pragma unroll
                     for (int o = 16; o > 0; o >>= 1) sum[q][r] += __shfl_xor_sync(0xFFFFFFFFu, sum[q][r], o);
                 }
-                if (lane == 0 && q < m.ne)
+                if (lane == 0 && q < m.ne) {
+                    // NVFP4 blobs end in FP32 {s_gate, s_up, s_down, 0}, each on its matrix's output (gate before SiLU)
+                    float sa = 1.0f, sb = 1.0f;
+                    if constexpr (TY == kNVFP4) {
+                        const float* t = (const float*) (m.blob + a.down_off + (int64_t) a.n_embd * a.d_row);
+                        sa = __ldg(t + (GLU ? 0 : 2));
+                        sb = __ldg(t + 1);
+                    }
 #pragma unroll
                     for (int r = 0; r < R; r++)
                         if (m.row0 + r < n_out) {
-                            float o = sum[q][r];
-                            if (GLU) o = o / (1.0f + __expf(-o)) * sum[q][R + r];
+                            float o = sum[q][r] * sa;
+                            if (GLU) o = o / (1.0f + __expf(-o)) * (sum[q][R + r] * sb);
                             dst[(int64_t) (m.e0 + q) * n_out + m.row0 + r] = o;
                         }
+                }
 #pragma unroll
                 for (int r = 0; r < RT; r++) sum[q][r] = 0.0f;
             }
@@ -456,3 +515,4 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
     extern "C" __global__ void __launch_bounds__(kWarps * 32) bp_layer_##G##_##D(LayerArgs a) { layer<G, D>(a); }
 BP_LAYER(18, 20) BP_LAYER(21, 20) BP_LAYER(22, 20) BP_LAYER(23, 20)
 BP_LAYER(18, 42) BP_LAYER(21, 42) BP_LAYER(22, 42) BP_LAYER(23, 42)
+BP_LAYER(40, 40)

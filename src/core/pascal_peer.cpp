@@ -55,8 +55,8 @@ bool dk(CUresult r, const char* what, std::string& err) {
     return false;
 }
 
-constexpr int kGuTypes[] = {18, 21, 22, 23};   // the cubin's bp_layer_G_D
-constexpr int kDownTypes[] = {20, 42};
+// the cubin's bp_layer_G_D, {G, D}: the GGML gate/up type and down type
+constexpr int kPairs[][2] = {{18, 20}, {21, 20}, {22, 20}, {23, 20}, {18, 42}, {21, 42}, {22, 42}, {23, 42}, {40, 40}};
 
 }  // namespace
 
@@ -106,18 +106,18 @@ bool PascalKernels::load(int device, std::string& err) {
     if (!dk(d.load(&m, basalt_pascal_cubin), "cuModuleLoadData (the embedded sm_60 cubin)", err)) return false;
     mod_ = m;
     (void) basalt_pascal_cubin_size;
-    for (int g : kGuTypes)
-        for (int t : kDownTypes) {
-            const std::string name = "bp_layer_" + std::to_string(g) + "_" + std::to_string(t);
-            CUfunction f = nullptr;
-            int per_sm = 0;
-            if (!dk(d.get(&f, m, name.c_str()), ("cuModuleGetFunction " + name).c_str(), err) ||
-                !dk(d.occupancy(&per_sm, f, kp::kWarps * 32, 0), "cuOccupancyMaxActiveBlocksPerMultiprocessor", err))
-                return false;
-            if (per_sm < 1) { err = "pascal tier: " + name + " does not fit on an SM"; return false; }
-            fn_[g][t] = f;
-            blocks_[g][t] = per_sm * nsm;   // the phases' grid barriers need every block resident
-        }
+    for (const auto& p : kPairs) {
+        const int g = p[0], t = p[1];
+        const std::string name = "bp_layer_" + std::to_string(g) + "_" + std::to_string(t);
+        CUfunction f = nullptr;
+        int per_sm = 0;
+        if (!dk(d.get(&f, m, name.c_str()), ("cuModuleGetFunction " + name).c_str(), err) ||
+            !dk(d.occupancy(&per_sm, f, kp::kWarps * 32, 0), "cuOccupancyMaxActiveBlocksPerMultiprocessor", err))
+            return false;
+        if (per_sm < 1) { err = "pascal tier: " + name + " does not fit on an SM"; return false; }
+        fn_[g][t] = f;
+        blocks_[g][t] = per_sm * nsm;   // the phases' grid barriers need every block resident
+    }
     return true;
 #endif
 }
