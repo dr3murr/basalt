@@ -11,6 +11,7 @@
 namespace basalt::kernels::pascal {
 
 inline constexpr int kGroupEntries = 2;   ///< the most entries of one group (split a larger one into groups)
+inline constexpr int kMaxEntries = 128;   ///< the most entries (and so groups) of one launch
 
 /// One group of a layer's peer entries: an expert blob ([gate rows | up rows | down rows], raw blocks) and up to
 /// kGroupEntries consecutive entries routed to it.
@@ -26,9 +27,9 @@ static_assert(sizeof(Group) == 16, "a group is one 16-byte load");
 /// to row out_row[e] there.  The kernel runs its phases with grid barriers, so it is launched with at most the
 /// blocks that are resident at once.
 struct LayerArgs {
-    const void* grp;           ///< `groups` Group records (16-byte aligned)
-    const int32_t* out_row;
-    const float* x;            ///< n_tok x n_embd
+    const void* grp;           ///< `groups` Group records (16-byte aligned; device or mapped host memory)
+    const int32_t* out_row;    ///< device or mapped host memory
+    const float* x;            ///< n_tok x n_embd (device or mapped host memory)
     void* y;                   ///< scratch: n_tok x n_embd halves
     void* ys;                  ///< scratch: n_tok x n_embd/32 float2
     float* h;                  ///< scratch: entries x n_ff

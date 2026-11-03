@@ -42,6 +42,18 @@ __device__ __forceinline__ uint4 sign_masks(uint32_t s) {
 
 constexpr int kNE = basalt::kernels::pascal::kGroupEntries;   // entries one decoded unit is dotted with
 
+// output rows per work item of the gate/up phase (each of gate and up) and of the down phase
+#ifndef BP_RG
+#define BP_RG 2
+#endif
+#ifndef BP_RD
+#define BP_RD 4
+#endif
+// blocks per SM the register budget is fitted to (__launch_bounds__' second argument)
+#ifndef BP_MINB
+#define BP_MINB 2
+#endif
+
 typedef const half2* Cols[kNE];   // each entry's 32 activations of the unit, as 16 half2
 
 __device__ __forceinline__ void fma_all(uint32_t w, const Cols& Y, int i, half2 (&acc)[kNE]) {
@@ -305,9 +317,9 @@ struct Item {
 // GLU: rows [0, R) of gate and the same R rows of up (at off1), stored as silu(gate) * up.
 // Activations: column `token` (by_tok) or `entry` of y/ys.  Output: row `entry` of dst (n_out floats).
 template <int TY, int R, bool GLU>
-__device__ __forceinline__ void mm_phase(const LayerArgs& a, uint32_t* stage, const uint32_t* grid, const uint4* sgn,
-                                         int n_in, int n_out, long long row_bytes, long long off0, long long off1,
-                                         const half* y, const float2* ys, bool by_tok, float* dst) {
+__device__ __forceinline__ void mm_phase(const LayerArgs& a, const uint4* grp, uint32_t* stage, const uint32_t* grid,
+                                         const uint4* sgn, int n_in, int n_out, long long row_bytes, long long off0,
+                                         long long off1, const half* y, const float2* ys, bool by_tok, float* dst) {
     typedef Shape<TY> S;
     constexpr int RT = GLU ? 2 * R : R;
     constexpr int UPB = Fmt<TY>::UPB;
@@ -318,7 +330,7 @@ __device__ __forceinline__ void mm_phase(const LayerArgs& a, uint32_t* stage, co
     const int nchunk = (nblk + S::CB - 1) / S::CB;
     const int items = a.groups * nrg;
     const int stride = gridDim.x * kWarps;
-    const auto raw = [&](int it) { return it < items ? __ldg((const uint4*) a.grp + it / nrg) : make_uint4(0, 0, 0, 0); };
+    const auto raw = [&](int it) { return it < items ? grp[it / nrg] : make_uint4(0, 0, 0, 0); };
     const auto item = [&](int it, uint4 gv) {
         Item m;
         m.blob = (const char*) (((unsigned long long) gv.y << 32) | gv.x);
@@ -452,7 +464,7 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
     static_assert(Fmt<TD>::GW == 0, "a down type with a codebook needs its table in shared memory too");
     constexpr int GW = Fmt<TG>::GW > 0 ? Fmt<TG>::GW : 1;
     constexpr int NS = Fmt<TG>::NS > 0 ? Fmt<TG>::NS : 1;
-    constexpr int SG = 4 * Shape<TG>::CW, SD = 4 * Shape<TD>::CW;   // gate/up: 2 rows each of gate and up; down: 4
+    constexpr int SG = 2 * BP_RG * Shape<TG>::CW, SD = BP_RD * Shape<TD>::CW;   // a work item's rows, one chunk each
     constexpr int SW = SG > SD ? SG : SD;
     __shared__ uint32_t stage[kWarps][SW];
     __shared__ __align__(16) uint32_t grid[GW];
@@ -466,6 +478,11 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
             sgn[i] = sign_masks(s);
         }
     }
+    // the plan (in mapped host memory: no copy engine in the decode path) into shared memory, read once per block
+    __shared__ uint4 sgrp[basalt::kernels::pascal::kMaxEntries];
+    __shared__ int32_t srow[basalt::kernels::pascal::kMaxEntries];
+    for (int i = threadIdx.x; i < a.groups; i += blockDim.x) sgrp[i] = ((const uint4*) a.grp)[i];
+    for (int i = threadIdx.x; i < a.entries; i += blockDim.x) srow[i] = a.out_row[i];
     uint32_t* st = stage[threadIdx.x / kWarp];
     const unsigned long long nb = gridDim.x;
     half* y = (half*) a.y;
@@ -487,15 +504,15 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
     };
     stamp(0);
     prep_rows(a.x, y, ys, a.n_tok * a.n_embd / 32);
-    grid_barrier(a.bar, a.bar_base + nb);   // also orders the tables' fill
+    grid_barrier(a.bar, a.bar_base + nb);   // also orders the tables' and the plan's fill
     stamp(1);
-    mm_phase<TG, 2, true>(a, st, grid, sgn, a.n_embd, a.n_ff, a.gu_row, 0, a.up_off, y, ys, true, a.h);
+    mm_phase<TG, BP_RG, true>(a, sgrp, st, grid, sgn, a.n_embd, a.n_ff, a.gu_row, 0, a.up_off, y, ys, true, a.h);
     grid_barrier(a.bar, a.bar_base + 2 * nb);
     stamp(2);
     prep_rows(a.h, hy, hys, a.entries * a.n_ff / 32);
     grid_barrier(a.bar, a.bar_base + 3 * nb);
     stamp(3);
-    mm_phase<TD, 4, false>(a, st, grid, sgn, a.n_ff, a.n_embd, a.d_row, a.down_off, 0, hy, hys, false, a.out);
+    mm_phase<TD, BP_RD, false>(a, sgrp, st, grid, sgn, a.n_ff, a.n_embd, a.d_row, a.down_off, 0, hy, hys, false, a.out);
     grid_barrier(a.bar, a.bar_base + 4 * nb);
     stamp(4);
     if (a.host_out != nullptr) {   // compact row e to row out_row[e], coalesced float4 stores over the link
@@ -503,7 +520,7 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
         const int total = a.entries * n4;
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
             const int r = i / n4, c = i - r * n4;
-            ((float4*) a.host_out)[(int64_t) __ldg(a.out_row + r) * n4 + c] = ((const float4*) a.out)[i];
+            ((float4*) a.host_out)[(int64_t) srow[r] * n4 + c] = ((const float4*) a.out)[i];
         }
     }
     stamp(5);
@@ -512,7 +529,7 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
 }  // namespace
 
 #define BP_LAYER(G, D) \
-    extern "C" __global__ void __launch_bounds__(kWarps * 32) bp_layer_##G##_##D(LayerArgs a) { layer<G, D>(a); }
+    extern "C" __global__ void __launch_bounds__(kWarps * 32, BP_MINB) bp_layer_##G##_##D(LayerArgs a) { layer<G, D>(a); }
 BP_LAYER(18, 20) BP_LAYER(21, 20) BP_LAYER(22, 20) BP_LAYER(23, 20)
 BP_LAYER(18, 42) BP_LAYER(21, 42) BP_LAYER(22, 42) BP_LAYER(23, 42)
 BP_LAYER(40, 40)
