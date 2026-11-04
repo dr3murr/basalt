@@ -521,7 +521,8 @@ private:
                        ConvCheckpoint::Source source = ConvCheckpoint::kPeriodic);
     void res_upload();
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
-    void apply_pending(bool wait, bool exchanges = true);
+    /// pascal_step false: leave a Pascal tier's round to peer_step (the decode loop, which steps it once per window)
+    void apply_pending(bool wait, bool exchanges = true, bool pascal_step = true);
     void peer_step();
     void rank_swaps(std::vector<Swap>& swaps, bool across);
     void rank_once(std::vector<Swap>& swaps, size_t room);

@@ -110,8 +110,10 @@ void Runtime::peer_step() {
     else if (peer.has_pending()) { peer.issue_pending(true); peer_landing = true; }
 }
 
-void Runtime::apply_pending(bool wait, bool exchanges) {
-    if (peer.valid()) {
+void Runtime::apply_pending(bool wait, bool exchanges, bool pascal_step) {
+    // a Pascal tier stepped here right after peer_step issued its refills would wait for the whole copy over its
+    // narrow link (~2 ms a window with the GPU idle); the decode loop leaves it to the next window's peer_step
+    if (peer.valid() && (pascal_step || !peer.pascal())) {
         if (!wait) peer.apply_pending(wait);
         else if (peer_landing) { peer.apply_pending(true); peer_landing = false; }
         else if (peer.has_pending()) { peer.issue_pending(true); peer_landing = true; }

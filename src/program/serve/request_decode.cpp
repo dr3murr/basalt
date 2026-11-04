@@ -171,7 +171,7 @@ Flow Request::decode() {
         ++adapt_age;
         if (adapt_age >= 2 && !(applied_early && adapt_age == 2)) {
             if (!runtime_.pending.empty()) basalt::core::decode_events().tag(1u << 1);
-            runtime_.apply_pending(true);
+            runtime_.apply_pending(true, true, false);   // a Pascal tier: peer_step above, once a window
         }
         // the elastic KV: the next window's cells backed before it runs (between windows, rare)
         if (runtime_.kv_floor > 0 && p + T + 64 > basalt::core::session_kv_cells(*runtime_.rsp)) {
@@ -429,7 +429,7 @@ Flow Request::decode() {
                 basalt::core::decode_events().tag(1u << 2);
                 apply_thr.run([&, boundary, copies] {
                     if (boundary) {
-                        runtime_.apply_pending(true, false);
+                        runtime_.apply_pending(true, false, false);
                         std::string perr;
                         if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                     }
