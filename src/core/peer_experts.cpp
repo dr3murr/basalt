@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <immintrin.h>
 #include <cstdlib>
 #include <stdexcept>
 #include "basalt/log.hpp"
@@ -37,7 +38,15 @@ struct Meta {                           // one block, uploaded with one copy per
     int32_t tok[CAP];
     int32_t count[4];                   // [0] groups, [1] entries
     int32_t out_row[CAP];               // multi-GPU: compact row -> entry row in the host `out`
+    float half_scale[CAP];              // Pascal: the fp16 result rows' per-row scales (written by the kernel)
 };
+
+// fp16 -> fp32 times s, n a multiple of 8 (the result rows are n_embd wide)
+__attribute__((target("avx,f16c"))) static void halves_to_floats(const uint16_t* src, float s, float* dst, int64_t n) {
+    const __m256 vs = _mm256_set1_ps(s);
+    for (int64_t i = 0; i < n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (src + i))), vs));
+}
 
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on device 0.
 struct On {
@@ -73,6 +82,7 @@ void PeerExperts::close() {
             if (p) cudaFree(p);
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
+        if (h_half_) cudaFreeHost(h_half_);
         if (h_meta_) cudaFreeHost(h_meta_);
         if (refill_ev_) cudaEventDestroy(refill_ev_);
         if (evict_ev_) cudaEventDestroy(evict_ev_);
@@ -80,6 +90,8 @@ void PeerExperts::close() {
         if (refill_) cudaStreamDestroy(refill_);
     }
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
+    h_half_ = nullptr;
+    half_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
     d_y_ = d_ys_ = d_hy_ = d_hys_ = nullptr;
@@ -189,7 +201,9 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
                       ck(cudaMalloc(&d_ys_, (size_t) CAP * (H / 32) * 8), "activation scales", err) &&
                       ck(cudaMalloc((void**) &d_h_, (size_t) CAP * ff * sizeof(float)), "swiglu rows", err) &&
                       ck(cudaMalloc(&d_hy_, (size_t) CAP * ff * 2), "swiglu activations", err) &&
-                      ck(cudaMalloc(&d_hys_, (size_t) CAP * (ff / 32) * 8), "swiglu scales", err)
+                      ck(cudaMalloc(&d_hys_, (size_t) CAP * (ff / 32) * 8), "swiglu scales", err) &&
+                      ck(cudaHostAlloc((void**) &h_half_, (size_t) CAP * H * 2, cudaHostAllocPortable | cudaHostAllocMapped),
+                         "fp16 result rows", err)
                 : ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
                       ck(cudaMalloc(&d_scratch_, scratch), "scratch", err));
     if (!alloc_ok) { close(); return false; }
@@ -285,6 +299,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     struct TmpEnd { ~TmpEnd() { g_tmp_l1 = std::chrono::steady_clock::now(); } } tmp_end;   // TMP_PEER_STATS
     const bool direct = out != nullptr;
     launched_direct_ = false;
+    launched_half_ = false;
     launched_rows_ = 0;
     row_of_.clear();
     const int64_t n = n_tok * k;
@@ -372,8 +387,14 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         a.hy = d_hy_;
         a.hys = d_hys_;
         a.out = d_out_;
-        const bool tmp_direct = direct && std::getenv("BASALT_TMP_PASCAL_STAGED") == nullptr;   // TMP_PASCAL_DEBUG
+        // the rows over the link as fp16 (half the bytes); finish expands them.  TMP_PASCAL_F32: the fp32 rows instead
+        static const bool tmp_f32 = std::getenv("BASALT_TMP_PASCAL_F32") != nullptr;
+        const bool half = !tmp_f32;
+        const bool tmp_direct = !half && direct && std::getenv("BASALT_TMP_PASCAL_STAGED") == nullptr;   // TMP_PASCAL_DEBUG
         a.host_out = tmp_direct ? out : nullptr;   // direct: the rows straight into the host `out` (mapped)
+        a.host_half = half ? h_half_ : nullptr;
+        a.half_scale = half ? m.half_scale : nullptr;   // mapped host memory (UVA)
+        launched_half_ = half;
         a.gu_row = (long long) L.gu_row;
         a.d_row = (long long) L.d_row;
         a.up_off = (long long) L.up_off;
@@ -439,6 +460,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
                 return false;
             }
         }
+        if (half) return true;
         if (tmp_direct) {
             launched_direct_ = true;
             g_tmp_la = std::chrono::steady_clock::now();   // TMP_PEER_STATS: "gap" = return path (~On)
@@ -494,6 +516,14 @@ bool PeerExperts::finish(float* out, std::string& err) {
                               n, 1e3 * l_ms / 20000, 1e3 * c_ms / 20000, 1e3 * k_ms / 20000, 1e3 * w_ms / 20000, rows_n / 20000);
             w_ms = rows_n = grp_n = l_ms = c_ms = k_ms = 0;
         }
+    }
+    if (launched_half_) {
+        launched_half_ = false;
+        const volatile float* sc = ((volatile Meta*) h_meta_)->half_scale;
+        for (size_t r = 0; r < row_of_.size(); ++r)
+            halves_to_floats(h_half_ + r * H, sc[r], out + (size_t) row_of_[r] * H, H);
+        launched_rows_ = 0;
+        return true;
     }
     if (launched_direct_) { launched_rows_ = 0; return true; }
     for (size_t r = 0; r < row_of_.size(); ++r)

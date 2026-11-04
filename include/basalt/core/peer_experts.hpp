@@ -172,6 +172,9 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    uint16_t* h_half_ = nullptr;                      ///< Pascal: the compact result rows as fp16 (mapped)
+    float* half_out_ = nullptr;                       ///< Pascal: the host rows `finish` expands them into
+    bool launched_half_ = false;
     std::unique_ptr<PascalKernels> pas_;              ///< a Pascal card's kernels (null on an sm_120 card)
     void* d_y_ = nullptr;  void* d_ys_ = nullptr;      // Pascal: the tokens' fp16 activations
     float* d_h_ = nullptr;                            // Pascal: the entries' SwiGLU rows

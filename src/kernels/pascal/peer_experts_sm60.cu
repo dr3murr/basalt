@@ -528,6 +528,35 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
             ((float4*) a.host_out)[(int64_t) srow[r] * n4 + c] = ((const float4*) a.out)[i];
         }
     }
+    if (a.host_half != nullptr) {   // compact row e as fp16 (half the link's bytes), scaled per row, a warp per row
+        const int n4 = a.n_embd / 4;
+        const int lane = threadIdx.x % kWarp;
+        for (int r = blockIdx.x * kWarps + threadIdx.x / kWarp; r < a.entries; r += gridDim.x * kWarps) {
+            const float4* src = (const float4*) a.out + (int64_t) r * n4;
+            float mx = 0.0f;
+            for (int c = lane; c < n4; c += kWarp) {
+                const float4 v = src[c];
+                mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, o));
+            // a power of two that puts the row's largest value in [2^14, 2^15): every value keeps fp16's 11 bits
+            // relative to it, none overflows (a NaN stays a NaN; a zero or non-finite row is sent unscaled)
+            int ex = 15;
+            if (mx > 0.0f && isfinite(mx)) frexpf(mx, &ex);
+            const float s = ldexpf(1.0f, 15 - ex);
+            uint2* dst = (uint2*) a.host_half + (int64_t) r * n4;
+            for (int c = lane; c < n4; c += kWarp) {
+                const float4 v = src[c];
+                const half2 lo = __floats2half2_rn(v.x * s, v.y * s), hi = __floats2half2_rn(v.z * s, v.w * s);
+                uint2 w;
+                w.x = *(const uint32_t*) &lo;
+                w.y = *(const uint32_t*) &hi;
+                dst[c] = w;
+            }
+            if (lane == 0) a.half_scale[r] = ldexpf(1.0f, ex - 15);
+        }
+    }
     stamp(5);
 }
 

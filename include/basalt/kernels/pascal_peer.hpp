@@ -44,6 +44,10 @@ struct LayerArgs {
     int32_t groups, entries, n_tok;
     int32_t n_embd, n_ff;
     unsigned long long* stamps;   ///< null, or 6 globaltimer stamps: start and the end of each phase (block 0)
+    /// mapped host rows as fp16, compact (entry e at row e), each scaled by a power of two so its largest value is in
+    /// [2^14, 2^15); row e's values are its halves times `half_scale[e]` (mapped host memory).  Or null.
+    void* host_half;
+    float* half_scale;
 };
 
 inline constexpr int kWarps = 8;      ///< warps per block
