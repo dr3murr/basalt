@@ -98,20 +98,28 @@ __device__ __forceinline__ void iq4_dot(const uint16_t* w, const Cols<NE>& Y, fl
 constexpr int kIQ3_XXS = 18, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kNVFP4 = 40, kQ2_0 = 42;
 
 // NVFP4's UE4M3 sub-block scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0 and 0x7F as 0, bit 7
-// ignored): the same float as the sm_120 kernels' nvfp4_scale_dev.
+// ignored), times 2^K: the same float as the sm_120 kernels' nvfp4_scale_dev for K = 0.  Branchless: the 7 bits at
+// float bit 20 are an fp32 with the UE4M3 exponent and mantissa; times 2^119 that is exact for the normals (e >= 1) and
+// the subnormals (e = 0: an fp32 denormal, m * 2^-129).  Needs fp32 denormals kept (no --use_fast_math / -ftz).
+template <int K>
 __device__ __forceinline__ float nvfp4_scale(uint32_t x) {
     const uint32_t v = x & 0x7F;
-    if (v == 0 || v == 0x7F) return 0.0f;
-    const uint32_t e = v >> 3, m = v & 7;
-    if (e == 0) return (float) m * (1.0f / 1024.0f);
-    return __uint_as_float(((e + 119) << 23) | (m << 20));
+    return v == 0x7F ? 0.0f : __uint_as_float(v << 20) * __uint_as_float((uint32_t) (127 + 119 + K) << 23);
 }
 
 // E2M1 code c (bit 3 the sign, bits 0-2 the magnitude) as fp16 bits (c & 7) << 9 | (c & 8) << 12 is exactly the doubled
 // E2M1 value (0,1,2,3,4,6,8,12) times 2^-15: e = 0 gives the subnormal m * 2^-15, e >= 1 the normal (2 + m) * 2^(e-16).
-// p holds two code bytes, one per 16-bit half (bytes 0 and 2); lo/hi place their low or high nibble.
-__device__ __forceinline__ uint32_t fp4_lo(uint32_t p) { return ((p << 9) & 0x0E000E00u) | ((p << 12) & 0x80008000u); }
-__device__ __forceinline__ uint32_t fp4_hi(uint32_t p) { return ((p << 5) & 0x0E000E00u) | ((p << 8) & 0x80008000u); }
+// fp4_pair<MS, SS>(q): two codes of q as such a half2, the codes whose magnitudes land at bits 9-11 and 25-27 with q
+// shifted left by MS (MS < 0: right by -MS) and whose signs land at bits 15 and 31 with it shifted by SS.
+template <int MS, int SS>
+__device__ __forceinline__ uint32_t fp4_pair(uint32_t q) {
+    const uint32_t m = MS >= 0 ? q << (MS & 31) : q >> (-MS & 31), s = SS >= 0 ? q << (SS & 31) : q >> (-SS & 31);
+    return (m & 0x0E000E00u) | (s & 0x80008000u);
+}
+
+// An NVFP4 consumer's fp16 activations are stored with bits 0 and 1 of the index within each 4 swapped (prep_rows),
+// so a code word's natural pairs, bytes 0/2 and 1/3, meet consecutive activations: no byte permutes in the decode.
+__device__ __forceinline__ int nvfp4_act_pos(int i) { return (i & ~3) | ((i & 1) << 1) | ((i >> 1) & 1); }
 
 template <int TY> struct Fmt;
 // UPB: 32-weight units per block; GW: codebook words in shared memory; NS: sign-mask entries
@@ -204,6 +212,7 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols<NE
     } else if constexpr (TY == kNVFP4) {
         // d[4] (UE4M3) at 0, qs[32] at 4; unit j = sub-blocks 2j and 2j+1, sub-block s's codes at qs[8s .. 8s+8):
         // byte k holds value k (low nibble) and value k + 8 (high nibble).  One fp16 sum per sub-block (own scale).
+        // Y is in the nvfp4_act_pos order: half2 i of a sub-block's values 4w.. is (4w, 4w+2), i + 1 (4w+1, 4w+3).
         half2 acc1[NE];
 #pragma unroll
         for (int q = 0; q < NE; q++) acc1[q] = __float2half2_rn(0.0f);
@@ -211,21 +220,20 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols<NE
         for (int h = 0; h < 2; h++) {
 #pragma unroll
             for (int w = 0; w < 2; w++) {
-                const uint32_t qw = u32_at(b16 + 2 + 8 * j + 4 * h + 2 * w);
-                const int i = 8 * h + 2 * w;   // half2 index of value 4w of the sub-block
-                const uint32_t p01 = __byte_perm(qw, 0, 0x4140), p23 = __byte_perm(qw, 0, 0x4342);
-                const uint32_t lo01 = fp4_lo(p01), lo23 = fp4_lo(p23), hi01 = fp4_hi(p01), hi23 = fp4_hi(p23);
-                if (h == 0) {
-                    fma_all(lo01, Y, i, acc); fma_all(lo23, Y, i + 1, acc);
-                    fma_all(hi01, Y, i + 4, acc); fma_all(hi23, Y, i + 5, acc);
-                } else {
-                    fma_all(lo01, Y, i, acc1); fma_all(lo23, Y, i + 1, acc1);
-                    fma_all(hi01, Y, i + 4, acc1); fma_all(hi23, Y, i + 5, acc1);
-                }
+                // whole words: the stage is word-aligned and a block (36 bytes) is too, so qs (at 4) is
+                const uint32_t qw = *(const uint32_t*) (bb + 4 + 16 * j + 8 * h + 4 * w);
+                const int i = 8 * h + 2 * w;   // half2 index of values 4w, 4w+2 of the sub-block
+                // values (4w, 4w+2): low nibbles of bytes 0, 2; (4w+1, 4w+3): of bytes 1, 3; + 8: the high nibbles
+                const uint32_t lo02 = fp4_pair<9, 12>(qw), lo13 = fp4_pair<1, 4>(qw);
+                const uint32_t hi02 = fp4_pair<5, 8>(qw), hi13 = fp4_pair<-3, 0>(qw);
+                half2(&ac)[NE] = h == 0 ? acc : acc1;
+                fma_all(lo02, Y, i, ac); fma_all(lo13, Y, i + 1, ac);
+                fma_all(hi02, Y, i + 4, ac); fma_all(hi13, Y, i + 5, ac);
             }
         }
         // the weights are 2^-15 times the doubled value; sc[].x undoes the 2^-24 of the other formats' encoding
-        const float f0 = nvfp4_scale(bb[2 * j]) * 0x1p-9f, f1 = nvfp4_scale(bb[2 * j + 1]) * 0x1p-9f;
+        const uint32_t sp = b16[j];   // the two sub-blocks' scales
+        const float f0 = nvfp4_scale<-9>(sp), f1 = nvfp4_scale<-9>(sp >> 8);
 #pragma unroll
         for (int q = 0; q < NE; q++)
             out[q] += (f0 * (__low2float(acc[q]) + __high2float(acc[q])) +
@@ -271,7 +279,8 @@ __device__ __forceinline__ void grid_barrier(unsigned long long* bar, unsigned l
 
 // x (fp32, 32-blocks) -> y (fp16) with y = x * 2^k per 32-block, max|y| < 2^15; ys[b] = {2^(24-k), sum of the
 // block's x} (2^24 undoes the subnormal weight encoding).  One warp per 32-block, over the whole grid.  Plain loads:
-// `x` may have been written earlier in this launch.
+// `x` may have been written earlier in this launch.  PERM: y in the nvfp4_act_pos order (an NVFP4 consumer).
+template <bool PERM>
 __device__ __forceinline__ void prep_rows(const float* x, half* y, float2* ys, int nblocks) {
     const int lane = threadIdx.x % kWarp;
     for (int b = blockIdx.x * kWarps + threadIdx.x / kWarp; b < nblocks; b += gridDim.x * kWarps) {
@@ -285,7 +294,7 @@ __device__ __forceinline__ void prep_rows(const float* x, half* y, float2* ys, i
         int e = 0;
         if (m > 0.0f) frexpf(m, &e);   // m in [2^(e-1), 2^e)
         const int k = 15 - e;
-        y[(int64_t) b * 32 + lane] = __float2half_rn(ldexpf(v, k));
+        y[(int64_t) b * 32 + (PERM ? nvfp4_act_pos(lane) : lane)] = __float2half_rn(ldexpf(v, k));
         if (lane == 0) ys[b] = make_float2(ldexpf(1.0f, 24 - k), s);
     }
 }
@@ -508,13 +517,13 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
         }
     };
     stamp(0);
-    prep_rows(a.x, y, ys, a.n_tok * a.n_embd / 32);
+    prep_rows<TG == kNVFP4>(a.x, y, ys, a.n_tok * a.n_embd / 32);
     grid_barrier(a.bar, a.bar_base + nb);   // also orders the tables' and the plan's fill
     stamp(1);
     mm_phase<TG, BP_RG, true>(a, sgrp, st, grid, sgn, a.n_embd, a.n_ff, a.gu_row, 0, a.up_off, y, ys, true, a.h);
     grid_barrier(a.bar, a.bar_base + 2 * nb);
     stamp(2);
-    prep_rows(a.h, hy, hys, a.entries * a.n_ff / 32);
+    prep_rows<TD == kNVFP4>(a.h, hy, hys, a.entries * a.n_ff / 32);
     grid_barrier(a.bar, a.bar_base + 3 * nb);
     stamp(3);
     mm_phase<TD, BP_RD, false>(a, sgrp, st, grid, sgn, a.n_ff, a.n_embd, a.d_row, a.down_off, 0, hy, hys, false, a.out);
