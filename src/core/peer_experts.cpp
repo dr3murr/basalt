@@ -262,44 +262,11 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
         return false;
     }
     resident_ = (int64_t) pick.size();
-    if (pas_ && std::getenv("BASALT_TMP_PASCAL_SELFTEST") != nullptr) {   // TMP_PASCAL_DEBUG
-        Meta& m = *(Meta*) h_meta_;
-        const int32_t slot0 = res_[(size_t) (f0.first * n_expert + f0.second)];
-        m.grp[0] = {(unsigned long long) cache_.device_slot(slot0), 0u | (1u << 16), 0u};
-        m.out_row[0] = 0;
-        const auto& f = lay.fmt[(size_t) f0.first];
-        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        std::string e2;
-        const bool ok = ck(cudaMemsetAsync(d_x_, 0, (size_t) H * sizeof(float), stream_), "x", e2) &&
-                        ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, stream_), "meta", e2);
-        basalt::kernels::pascal::LayerArgs a{};
-        a.grp = ((Meta*) d_meta_)->grp; a.out_row = ((Meta*) d_meta_)->out_row; a.x = d_x_; a.y = d_y_; a.ys = d_ys_;
-        a.h = d_h_; a.hy = d_hy_; a.hys = d_hys_; a.out = d_out_; a.host_out = nullptr; a.plan = d_plan_;
-        a.gu_row = (long long) L.gu_row; a.d_row = (long long) L.d_row; a.up_off = (long long) L.up_off;
-        a.down_off = (long long) L.down_off; a.groups = 1; a.entries = 1; a.n_tok = std::getenv("BASALT_TMP_NTOK0") ? 0 : 1; a.n_embd = (int32_t) f.n_embd;
-        a.n_ff = (int32_t) f.n_ff;
-        unsigned long long* tst = nullptr;
-        (void) cudaHostAlloc((void**) &tst, 4096, cudaHostAllocPortable | cudaHostAllocMapped);
-        std::memset(tst, 0, 4096);
-        a.stamps = tst;
-        const bool ok2 = ok && pas_->layer(f.gu_type, f.d_type, a, stream_, e2);
-        const cudaError_t se = cudaStreamSynchronize(stream_);
-        basalt::log::info("basalt", "TMP pascal self-test layer %d types %d/%d: launch %s, sync %s %s", f0.first, f.gu_type,
-                          f.d_type, ok2 ? "ok" : "failed", cudaGetErrorString(se), e2.c_str());
-        std::string prog;
-        for (int b = 0; b < 56; ++b) prog += std::to_string(tst[8 + b]);
-        basalt::log::info("basalt", "TMP pascal self-test phases %s; bar %p x %p", prog.c_str(), pas_->tmp_bar(), (void*) d_x_);
-    }
     return true;
 }
 
-static std::chrono::steady_clock::time_point g_tmp_l0, g_tmp_l1, g_tmp_la, g_tmp_lb;   // TMP_PEER_STATS
-static cudaEvent_t* g_tmp_ev = nullptr;   // TMP_PEER_STATS
-
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
-    g_tmp_l0 = std::chrono::steady_clock::now();
-    struct TmpEnd { ~TmpEnd() { g_tmp_l1 = std::chrono::steady_clock::now(); } } tmp_end;   // TMP_PEER_STATS
     const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_half_ = false;
@@ -348,9 +315,6 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    static cudaEvent_t tev[3] = {};   // TMP_PEER_STATS: before the copies, after them, after the kernel
-    if (tev[0] == nullptr) for (auto& e : tev) cudaEventCreate(&e);
-    cudaEventRecord(tev[0], s);
     // a Pascal tier reads x from its own pinned buffer: the verifier's rows are pinned in CUDA0's context only.  It
     // reads x and the plan in place (mapped, portable): a copy would queue behind the tier's multi-MB expert swaps
     // on the same copy direction of its narrow link.
@@ -360,8 +324,6 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         (!ck(cudaMemcpyAsync(d_x_, stage_x ? h_x_ : x, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
          !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err)))
         return false;
-    g_tmp_la = std::chrono::steady_clock::now();   // TMP_PEER_STATS
-    cudaEventRecord(tev[1], s);
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     if (!lay.native) {
@@ -371,15 +333,6 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     const auto& f = lay.fmt[(size_t) layer];
     const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
     if (pas_) {
-        static bool told = false;   // TMP_PASCAL_DEBUG
-        if (!told && direct) {
-            told = true;
-            cudaPointerAttributes pa{};
-            const cudaError_t pe = cudaPointerGetAttributes(&pa, out);
-            basalt::log::info("basalt", "TMP pascal out %p: %s type %d device %d dev ptr %p host ptr %p", (void*) out,
-                              cudaGetErrorString(pe), (int) pa.type, pa.device, pa.devicePointer, pa.hostPointer);
-            cudaGetLastError();
-        }
         basalt::kernels::pascal::LayerArgs a{};
         a.grp = m.grp;           // mapped host memory (UVA: the host address is the device address)
         a.out_row = m.out_row;
@@ -391,14 +344,11 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         a.hys = d_hys_;
         a.plan = d_plan_;
         a.out = d_out_;
-        // the rows over the link as fp16 (half the bytes); finish expands them.  TMP_PASCAL_F32: the fp32 rows instead
-        static const bool tmp_f32 = std::getenv("BASALT_TMP_PASCAL_F32") != nullptr;
-        const bool half = !tmp_f32;
-        const bool tmp_direct = !half && direct && std::getenv("BASALT_TMP_PASCAL_STAGED") == nullptr;   // TMP_PASCAL_DEBUG
-        a.host_out = tmp_direct ? out : nullptr;   // direct: the rows straight into the host `out` (mapped)
-        a.host_half = half ? h_half_ : nullptr;
-        a.half_scale = half ? m.half_scale : nullptr;   // mapped host memory (UVA)
-        launched_half_ = half;
+        // the rows over the link as fp16, each scaled by a power of two (half the bytes); finish expands them
+        a.host_out = nullptr;
+        a.host_half = h_half_;
+        a.half_scale = m.half_scale;   // mapped host memory (UVA)
+        launched_half_ = true;
         a.gu_row = (long long) L.gu_row;
         a.d_row = (long long) L.d_row;
         a.up_off = (long long) L.up_off;
@@ -408,70 +358,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         a.n_tok = (int32_t) n_tok;
         a.n_embd = (int32_t) f.n_embd;
         a.n_ff = (int32_t) f.n_ff;
-        static unsigned long long* tmp_st = nullptr;   // TMP_PASCAL_DEBUG
-        const bool tmp_sync = std::getenv("BASALT_TMP_PASCAL_SYNC") != nullptr;
-        static const bool tmp_stamps = std::getenv("BASALT_TMP_STAMPS") != nullptr;
-        if ((tmp_sync || tmp_stamps) && tmp_st == nullptr)
-            (void) cudaHostAlloc((void**) &tmp_st, 4096, cudaHostAllocPortable | cudaHostAllocMapped);
-        if (tmp_stamps && tmp_st[5] != 0) {   // the previous launch's phases (it has finished: finish() ran)
-            static double ph[5] = {};
-            static long long np = 0;
-            for (int i = 0; i < 5; ++i) ph[i] += (double) (tmp_st[i + 1] - tmp_st[i]) * 1e-3;
-            if (++np % 20000 == 0) {
-                basalt::log::info("basalt", "TMP phases us: prep %.1f gu %.1f hprep %.1f down %.1f scatter %.1f",
-                                  ph[0] / 20000, ph[1] / 20000, ph[2] / 20000, ph[3] / 20000, ph[4] / 20000);
-                for (double& v : ph) v = 0;
-            }
-        }
-        if (tmp_sync || tmp_stamps) { std::memset(tmp_st, 0, 4096); a.stamps = tmp_st; }
-        const auto tq0 = std::chrono::steady_clock::now();   // TMP_PEER_STATS
-        if (!pas_->layer(f.gu_type, f.d_type, a, s, err)) return false;
-        const auto tq1 = std::chrono::steady_clock::now();
-        {
-            static double acc = 0;
-            static long long cnt = 0;
-            acc += std::chrono::duration<double, std::micro>(tq1 - tq0).count();
-            if (++cnt % 20000 == 0) { basalt::log::info("basalt", "TMP layer() call %.1f us", acc / 20000); acc = 0; }
-        }
-        g_tmp_lb = std::chrono::steady_clock::now();   // TMP_PEER_STATS
-        cudaEventRecord(tev[2], s);
-        g_tmp_ev = tev;
-        if (tmp_sync) {   // TMP_PASCAL_DEBUG
-            const cudaError_t se = cudaStreamSynchronize(s);
-            if (se != cudaSuccess) {
-                basalt::log::error("basalt", "TMP pascal layer %lld: %s; n_tok %lld k %lld rows %d groups %d pgroups %d types %d/%d stamps %llu %llu %llu %llu %llu %llu",
-                                   (long long) layer, cudaGetErrorString(se), (long long) n_tok, (long long) k, rows, groups,
-                                   pgroups, f.gu_type, f.d_type, tmp_st[0], tmp_st[1], tmp_st[2], tmp_st[3], tmp_st[4], tmp_st[5]);
-                {
-                    std::string prog;
-                    for (int b = 0; b < 56; ++b) prog += std::to_string(tmp_st[8 + b]);
-                    basalt::log::error("basalt", "TMP  block phases: %s", prog.c_str());
-                }
-                const void* ps[] = {a.grp, a.out_row, a.x, a.y, a.ys, a.h, a.hy, a.hys, a.out, pas_->tmp_bar(), a.stamps};
-                for (const void* p : ps) {
-                    cudaPointerAttributes pa{};
-                    const cudaError_t pe = cudaPointerGetAttributes(&pa, p);
-                    basalt::log::error("basalt", "TMP  ptr %p: %s type %d device %d", p, cudaGetErrorString(pe), (int) pa.type, pa.device);
-                }
-                for (int g = 0; g < pgroups; ++g) {
-                    cudaPointerAttributes pa{};
-                    const cudaError_t pe = cudaPointerGetAttributes(&pa, (const void*) m.grp[g].blob);
-                    basalt::log::error("basalt", "TMP  grp %d: blob %llx (%s type %d device %d) first %u count %u toks %08x", g,
-                                       (unsigned long long) m.grp[g].blob, cudaGetErrorString(pe), (int) pa.type, pa.device,
-                                       m.grp[g].first_and_count & 0xffffu, m.grp[g].first_and_count >> 16, m.grp[g].tokens);
-                }
-                err = "pascal debug";
-                return false;
-            }
-        }
-        if (half) return true;
-        if (tmp_direct) {
-            launched_direct_ = true;
-            g_tmp_la = std::chrono::steady_clock::now();   // TMP_PEER_STATS: "gap" = return path (~On)
-            return true;
-        }
-        return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
-                  "results", err);
+        return pas_->layer(f.gu_type, f.d_type, a, s, err);
     }
     basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
     basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
@@ -501,26 +388,6 @@ bool PeerExperts::finish(float* out, std::string& err) {
         if (!ck(e, "finish", err)) return false;
     }
     ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    {   // TMP_PEER_STATS: remove after the Pascal tier measurements
-        static double w_ms = 0, rows_n = 0, grp_n = 0, l_ms = 0, c_ms = 0, k_ms = 0;
-        static long long n = 0;
-        w_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        l_ms += std::chrono::duration<double, std::milli>(g_tmp_l1 - g_tmp_l0).count();
-        if (g_tmp_ev != nullptr) {
-            float a = 0, b = 0;
-            cudaEventElapsedTime(&a, g_tmp_ev[0], g_tmp_ev[1]);
-            cudaEventElapsedTime(&b, g_tmp_ev[1], g_tmp_ev[2]);
-            c_ms += a;
-            k_ms += b;
-        }
-        rows_n += (double) launched_rows_;
-        grp_n += (double) row_of_.size();
-        if (++n % 20000 == 0) {
-            basalt::log::info("basalt", "TMP peer: %lld launches, launch %.1f us, copies %.1f us, kernel %.1f us, wait %.1f us, %.1f rows per launch",
-                              n, 1e3 * l_ms / 20000, 1e3 * c_ms / 20000, 1e3 * k_ms / 20000, 1e3 * w_ms / 20000, rows_n / 20000);
-            w_ms = rows_n = grp_n = l_ms = c_ms = k_ms = 0;
-        }
-    }
     if (launched_half_) {
         launched_half_ = false;
         const volatile float* sc = ((volatile Meta*) h_meta_)->half_scale;

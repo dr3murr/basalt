@@ -34,8 +34,7 @@ public:
     bool load(int device, std::string& err);
     /// Whether the cubin has a layer kernel for this gate/up and down type pair.
     bool supports(int gu_type, int d_type) const;
-    const void* tmp_bar() const { return bar_; }   // TMP_PASCAL_DEBUG
-    /// One layer's entries (kernels::pascal::LayerArgs; `bar`, `bar_base` and `stamps` are filled in here), queued on
+    /// One layer's entries (kernels::pascal::LayerArgs; `bar` and `bar_base` are filled in here), queued on
     /// `s` with as many blocks as are resident at once.
     bool layer(int gu_type, int d_type, basalt::kernels::pascal::LayerArgs a, cudaStream_t s, std::string& err);
 
