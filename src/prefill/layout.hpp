@@ -71,12 +71,19 @@ constexpr int64_t kPeerSlowRows = 2559;
 // runs as far ahead): copies on one link are served in the order they were queued, and the peer's result rows, which
 // the layer's end waits for, would otherwise queue behind the copies for the layers after it.
 constexpr int kPeerInFlight = 16;
-// --peer-exclusive with a Pascal tier: of the experts only it holds, one in kPeerLinkEvery comes into a prompt's
-// stream over its link and the rest from the pack file through the stager, so its narrow link (a card behind the
-// chipset, ~2.4 GB/s) and the SSD stream side by side.  Fixed by (layer, expert), so every pass agrees.  16K-token
-// prefill, NVFP4, P100 on PCIe 3.0 x4: all over the link 1569 tok/s, none 1860, 1 in 4 2270, 1 in 3 2449, 1 in 2 2580.
-constexpr int kPeerLinkEvery = 2;
-constexpr bool peer_link_pick(int64_t l, int32_t e) { return (l * 7 + e) % kPeerLinkEvery == 0; }
+// --peer-exclusive with a Pascal tier: of the experts only it holds, a share (in 256ths) comes into a prompt's stream
+// over its link and the rest from the pack file through the stager, so its narrow link (a card behind the chipset,
+// ~2.4 GB/s) and the SSD stream side by side.  Fixed by a hash of (layer, expert), so every pass agrees.  NVFP4, P100
+// on PCIe 3.0 x4, prefill tok/s 16K / 64K: share 0 3232/3296, 64 3729/3783, 96 4021/4055, 112 4121/4119,
+// 128 4065/4085, 154 3795/3783, 179 3493/3483, 204 3223/3217 (all over the link: 1569 at 16K).
+constexpr int kPeerLinkShare256 = 112;
+constexpr bool peer_link_pick(int64_t l, int32_t e) {
+    uint32_t h = (uint32_t) l * 0x9E3779B1u ^ (uint32_t) e * 0x85EBCA77u;
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12;
+    return (int) (h & 255u) < kPeerLinkShare256;
+}
 constexpr size_t al256(size_t v) { return (v + 255) & ~(size_t) 255; }
 
 struct Fp4Ptrs {
