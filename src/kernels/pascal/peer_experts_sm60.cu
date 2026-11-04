@@ -492,11 +492,19 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
             sgn[i] = sign_masks(s);
         }
     }
-    // the plan (in mapped host memory: no copy engine in the decode path) into shared memory, read once per block
-    __shared__ uint4 sgrp[basalt::kernels::pascal::kMaxEntries];
-    __shared__ int32_t srow[basalt::kernels::pascal::kMaxEntries];
-    for (int i = threadIdx.x; i < a.groups; i += blockDim.x) sgrp[i] = ((const uint4*) a.grp)[i];
-    for (int i = threadIdx.x; i < a.entries; i += blockDim.x) srow[i] = a.out_row[i];
+    // the plan (in mapped host memory: no copy engine in the decode path) crosses the link once: each record copied
+    // by one thread of the grid into `plan`, which every block reads into shared memory after the first barrier
+    // (every block reading it over the link cost ~80 us at 12 entries, ~160 us at 35)
+    constexpr int kMax = basalt::kernels::pascal::kMaxEntries;
+    __shared__ uint4 sgrp[kMax];
+    __shared__ int32_t srow[kMax];
+    uint4* pgrp = (uint4*) a.plan;
+    int32_t* prow = (int32_t*) (pgrp + kMax);
+    {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < a.groups) pgrp[i] = ((const uint4*) a.grp)[i];
+        if (i < a.entries) prow[i] = a.out_row[i];
+    }
     uint32_t* st = stage[threadIdx.x / kWarp];
     const unsigned long long nb = gridDim.x;
     half* y = (half*) a.y;
@@ -519,6 +527,10 @@ __device__ __forceinline__ void layer(const LayerArgs& a) {
     stamp(0);
     prep_rows<TG == kNVFP4>(a.x, y, ys, a.n_tok * a.n_embd / 32);
     grid_barrier(a.bar, a.bar_base + nb);   // also orders the tables' and the plan's fill
+    // L2 loads: written in this launch, after nothing of it could be in L1
+    for (int i = threadIdx.x; i < a.groups; i += blockDim.x) sgrp[i] = __ldcg(pgrp + i);
+    for (int i = threadIdx.x; i < a.entries; i += blockDim.x) srow[i] = __ldcg(prow + i);
+    __syncthreads();
     stamp(1);
     mm_phase<TG, BP_RG, true>(a, sgrp, st, grid, sgn, a.n_embd, a.n_ff, a.gu_row, 0, a.up_off, y, ys, true, a.h);
     grid_barrier(a.bar, a.bar_base + 2 * nb);

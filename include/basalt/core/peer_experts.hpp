@@ -179,6 +179,7 @@ private:
     void* d_y_ = nullptr;  void* d_ys_ = nullptr;      // Pascal: the tokens' fp16 activations
     float* d_h_ = nullptr;                            // Pascal: the entries' SwiGLU rows
     void* d_hy_ = nullptr; void* d_hys_ = nullptr;     // Pascal: their fp16 activations
+    void* d_plan_ = nullptr;                          // Pascal: the plan's device copy (LayerArgs::plan)
 };
 
 }  // namespace basalt::core

@@ -48,6 +48,8 @@ struct LayerArgs {
     /// [2^14, 2^15); row e's values are its halves times `half_scale[e]` (mapped host memory).  Or null.
     void* host_half;
     float* half_scale;
+    /// scratch (device): the plan copied once from `grp` and `out_row`, kMaxEntries Groups then kMaxEntries int32
+    void* plan;
 };
 
 inline constexpr int kWarps = 8;      ///< warps per block

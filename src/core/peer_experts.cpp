@@ -78,7 +78,7 @@ void PeerExperts::close() {
         if (d_meta_) cudaFree(d_meta_);
         if (d_q8_) cudaFree(d_q8_);
         if (d_scratch_) cudaFree(d_scratch_);
-        for (void* p : {d_y_, d_ys_, (void*) d_h_, d_hy_, d_hys_})
+        for (void* p : {d_y_, d_ys_, (void*) d_h_, d_hy_, d_hys_, d_plan_})
             if (p) cudaFree(p);
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
@@ -94,7 +94,7 @@ void PeerExperts::close() {
     half_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
-    d_y_ = d_ys_ = d_hy_ = d_hys_ = nullptr;
+    d_y_ = d_ys_ = d_hy_ = d_hys_ = d_plan_ = nullptr;
     d_h_ = nullptr;
     pas_.reset();
     stream_ = refill_ = nullptr;
@@ -202,6 +202,9 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
                       ck(cudaMalloc((void**) &d_h_, (size_t) CAP * ff * sizeof(float)), "swiglu rows", err) &&
                       ck(cudaMalloc(&d_hy_, (size_t) CAP * ff * 2), "swiglu activations", err) &&
                       ck(cudaMalloc(&d_hys_, (size_t) CAP * (ff / 32) * 8), "swiglu scales", err) &&
+                      ck(cudaMalloc(&d_plan_, (size_t) basalt::kernels::pascal::kMaxEntries *
+                                                  (sizeof(basalt::kernels::pascal::Group) + sizeof(int32_t))),
+                         "plan copy", err) &&
                       ck(cudaHostAlloc((void**) &h_half_, (size_t) CAP * H * 2, cudaHostAllocPortable | cudaHostAllocMapped),
                          "fp16 result rows", err)
                 : ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
@@ -271,7 +274,7 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
                         ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, stream_), "meta", e2);
         basalt::kernels::pascal::LayerArgs a{};
         a.grp = ((Meta*) d_meta_)->grp; a.out_row = ((Meta*) d_meta_)->out_row; a.x = d_x_; a.y = d_y_; a.ys = d_ys_;
-        a.h = d_h_; a.hy = d_hy_; a.hys = d_hys_; a.out = d_out_; a.host_out = nullptr;
+        a.h = d_h_; a.hy = d_hy_; a.hys = d_hys_; a.out = d_out_; a.host_out = nullptr; a.plan = d_plan_;
         a.gu_row = (long long) L.gu_row; a.d_row = (long long) L.d_row; a.up_off = (long long) L.up_off;
         a.down_off = (long long) L.down_off; a.groups = 1; a.entries = 1; a.n_tok = std::getenv("BASALT_TMP_NTOK0") ? 0 : 1; a.n_embd = (int32_t) f.n_embd;
         a.n_ff = (int32_t) f.n_ff;
@@ -386,6 +389,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         a.h = d_h_;
         a.hy = d_hy_;
         a.hys = d_hys_;
+        a.plan = d_plan_;
         a.out = d_out_;
         // the rows over the link as fp16 (half the bytes); finish expands them.  TMP_PASCAL_F32: the fp32 rows instead
         static const bool tmp_f32 = std::getenv("BASALT_TMP_PASCAL_F32") != nullptr;
