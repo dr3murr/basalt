@@ -54,15 +54,17 @@ constexpr int kNE = basalt::kernels::pascal::kGroupEntries;   // entries one dec
 #define BP_MINB 2
 #endif
 
-typedef const half2* Cols[kNE];   // each entry's 32 activations of the unit, as 16 half2
+template <int NE> using Cols = const half2* [NE];   // each entry's 32 activations of the unit, as 16 half2
 
-__device__ __forceinline__ void fma_all(uint32_t w, const Cols& Y, int i, half2 (&acc)[kNE]) {
+template <int NE>
+__device__ __forceinline__ void fma_all(uint32_t w, const Cols<NE>& Y, int i, half2 (&acc)[NE]) {
 #pragma unroll
-    for (int q = 0; q < kNE; q++) acc[q] = __hfma2(*(const half2*) &w, Y[q][i], acc[q]);
+    for (int q = 0; q < NE; q++) acc[q] = __hfma2(*(const half2*) &w, Y[q][i], acc[q]);
 }
 
 // 8 weights: two 4-byte codebook entries a (w0..3) and b (w4..7), sign masks m; activations Y[.][i .. i+4)
-__device__ __forceinline__ void grid8(uint32_t a, uint32_t b, uint4 m, const Cols& Y, int i, half2 (&acc)[kNE]) {
+template <int NE>
+__device__ __forceinline__ void grid8(uint32_t a, uint32_t b, uint4 m, const Cols<NE>& Y, int i, half2 (&acc)[NE]) {
     fma_all(__byte_perm(a, 0, 0x4140) ^ m.x, Y, i + 0, acc);
     fma_all(__byte_perm(a, 0, 0x4342) ^ m.y, Y, i + 1, acc);
     fma_all(__byte_perm(b, 0, 0x4140) ^ m.z, Y, i + 2, acc);
@@ -70,11 +72,12 @@ __device__ __forceinline__ void grid8(uint32_t a, uint32_t b, uint4 m, const Col
 }
 
 // 32 IQ4 codes (16 bytes at w: code k low nibble, k+16 high) dotted with Y; the table is looked up +128
-__device__ __forceinline__ void iq4_dot(const uint16_t* w, const Cols& Y, float (&s)[kNE]) {
+template <int NE>
+__device__ __forceinline__ void iq4_dot(const uint16_t* w, const Cols<NE>& Y, float (&s)[NE]) {
     constexpr uint32_t T0 = 0x3F2D1801u, T1 = 0x766A5D4Fu, T2 = 0xA6998D81u, T3 = 0xF1D9C5B5u;
-    half2 acc[kNE];
+    half2 acc[NE];
 #pragma unroll
-    for (int q = 0; q < kNE; q++) acc[q] = __float2half2_rn(0.0f);
+    for (int q = 0; q < NE; q++) acc[q] = __float2half2_rn(0.0f);
 #pragma unroll
     for (int k = 0; k < 4; k++) {
         const uint32_t q = u32_at(w + 2 * k);
@@ -88,7 +91,7 @@ __device__ __forceinline__ void iq4_dot(const uint16_t* w, const Cols& Y, float 
         fma_all(__byte_perm(v1, 0, 0x4341), Y, 8 + 2 * k + 1, acc);
     }
 #pragma unroll
-    for (int q = 0; q < kNE; q++) s[q] = __low2float(acc[q]) + __high2float(acc[q]);
+    for (int q = 0; q < NE; q++) s[q] = __low2float(acc[q]) + __high2float(acc[q]);
 }
 
 // GGML type ids
@@ -104,16 +107,11 @@ __device__ __forceinline__ float nvfp4_scale(uint32_t x) {
     return __uint_as_float(((e + 119) << 23) | (m << 20));
 }
 
-// 4 E2M1 codes (the low nibble of each byte of x; bit 3 the sign) -> two half2 subnormal patterns (doubled magnitude
-// 0,1,2,3,4,6,8,12 times 2^-24, exact): w01 = (code 0, code 1), w23 = (code 2, code 3).
-__device__ __forceinline__ void fp4_pairs(uint32_t x, uint32_t& w01, uint32_t& w23) {
-    constexpr uint32_t T0 = 0x03020100u, T1 = 0x0C080604u;
-    const uint32_t c = x & 0x07070707u;
-    const uint32_t s = c | (c >> 4);                                // byte 0: c0 | c1 << 4, byte 2: c2 | c3 << 4
-    const uint32_t m = prmt(T0, T1, __byte_perm(s, 0, 0x0020));     // selector nibbles c0..c3, all below 8
-    w01 = __byte_perm(m, 0, 0x4140) | ((x & 0x8u) << 12) | ((x & 0x800u) << 20);
-    w23 = __byte_perm(m, 0, 0x4342) | ((x & 0x80000u) >> 4) | ((x & 0x8000000u) << 4);
-}
+// E2M1 code c (bit 3 the sign, bits 0-2 the magnitude) as fp16 bits (c & 7) << 9 | (c & 8) << 12 is exactly the doubled
+// E2M1 value (0,1,2,3,4,6,8,12) times 2^-15: e = 0 gives the subnormal m * 2^-15, e >= 1 the normal (2 + m) * 2^(e-16).
+// p holds two code bytes, one per 16-bit half (bytes 0 and 2); lo/hi place their low or high nibble.
+__device__ __forceinline__ uint32_t fp4_lo(uint32_t p) { return ((p << 9) & 0x0E000E00u) | ((p << 12) & 0x80008000u); }
+__device__ __forceinline__ uint32_t fp4_hi(uint32_t p) { return ((p << 5) & 0x0E000E00u) | ((p << 8) & 0x80008000u); }
 
 template <int TY> struct Fmt;
 // UPB: 32-weight units per block; GW: codebook words in shared memory; NS: sign-mask entries
@@ -128,14 +126,14 @@ template <> struct Fmt<kNVFP4>   { typedef block_nvfp4 block;   static constexpr
 // One unit (32 weights: unit j of the block at bb, in shared memory), unpacked once and dotted with each entry's
 // matching 32-block of fp16 activations Y[q]; sc[q] = {rescale, fp32 sum of the block's x}.  Adds each entry's
 // fp32 contribution to out[q].
-template <int TY>
-__device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y, const float2 (&sc)[kNE],
-                                         const uint32_t* grid, const uint4* sgn, float (&out)[kNE]) {
+template <int TY, int NE>
+__device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols<NE>& Y, const float2 (&sc)[NE],
+                                         const uint32_t* grid, const uint4* sgn, float (&out)[NE]) {
     const uint16_t* b16 = (const uint16_t*) bb;
     const float d = __half2float(__ushort_as_half(b16[0]));
-    half2 acc[kNE];
+    half2 acc[NE];
 #pragma unroll
-    for (int q = 0; q < kNE; q++) acc[q] = __float2half2_rn(0.0f);
+    for (int q = 0; q < NE; q++) acc[q] = __float2half2_rn(0.0f);
     if constexpr (TY == kIQ3_XXS) {
         // qs[0..63]: one grid index per 4 weights; qs[64..95]: per unit, 4 x 7-bit sign indices + 4-bit scale
         const uint32_t q0 = u32_at(b16 + 1 + 4 * j);
@@ -149,7 +147,7 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
         }
         const float f = d * (0.5f + (float) (aux >> 28)) * 0.5f;
 #pragma unroll
-        for (int q = 0; q < kNE; q++) out[q] += f * (__low2float(acc[q]) + __high2float(acc[q])) * sc[q].x;
+        for (int q = 0; q < NE; q++) out[q] += f * (__low2float(acc[q]) + __high2float(acc[q])) * sc[q].x;
     } else if constexpr (TY == kIQ3_S) {
         // qs[0..63] at 2: low 8 bits of the index per 4 weights; qh[8] at 66; signs[32] at 74; scales[4] at 106
         const uint32_t q0 = u32_at(b16 + 1 + 4 * j);
@@ -167,16 +165,16 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
         }
         const float f = d * (float) (1 + 2 * ls);
 #pragma unroll
-        for (int q = 0; q < kNE; q++) out[q] += f * (__low2float(acc[q]) + __high2float(acc[q])) * sc[q].x;
+        for (int q = 0; q < NE; q++) out[q] += f * (__low2float(acc[q]) + __high2float(acc[q])) * sc[q].x;
     } else if constexpr (TY == kIQ2_S) {
         // qs[0..31] at 2: low 8 bits of the index per 8 weights; qs[32..63] at 34: sign bytes; qh[8] at 66; scales at 74
         const uint32_t qi = u32_at(b16 + 1 + 2 * j);
         const uint32_t sg = u32_at(b16 + 17 + 2 * j);
         const uint32_t qh = bb[66 + j];
         const uint32_t ls = bb[74 + j];
-        half2 acc1[kNE];
+        half2 acc1[NE];
 #pragma unroll
-        for (int q = 0; q < kNE; q++) acc1[q] = __float2half2_rn(0.0f);
+        for (int q = 0; q < NE; q++) acc1[q] = __float2half2_rn(0.0f);
 #pragma unroll
         for (int g = 0; g < 4; g++) {
             const uint32_t idx = ((qi >> (8 * g)) & 0xFF) | ((qh << (8 - 2 * g)) & 0x300);
@@ -186,11 +184,11 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
         }
         const float f0 = d * 0.25f * (0.5f + (float) (ls & 0x0F)), f1 = d * 0.25f * (0.5f + (float) (ls >> 4));
 #pragma unroll
-        for (int q = 0; q < kNE; q++)
+        for (int q = 0; q < NE; q++)
             out[q] += (f0 * (__low2float(acc[q]) + __high2float(acc[q])) +
                        f1 * (__low2float(acc1[q]) + __high2float(acc1[q]))) * sc[q].x;
     } else if constexpr (TY == kIQ4_XS || TY == kIQ4_NL) {
-        float s[kNE];
+        float s[NE];
         float dl = d;
         if constexpr (TY == kIQ4_XS) {
             // d, scales_h (u16) at 2, scales_l[4] at 4, qs[128] at 8: unit j's codes are qs[16j .. 16j+16)
@@ -202,22 +200,21 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
             iq4_dot(b16 + 1, Y, s);
         }
 #pragma unroll
-        for (int q = 0; q < kNE; q++) out[q] += dl * fmaf(s[q], sc[q].x, -128.0f * sc[q].y);
+        for (int q = 0; q < NE; q++) out[q] += dl * fmaf(s[q], sc[q].x, -128.0f * sc[q].y);
     } else if constexpr (TY == kNVFP4) {
         // d[4] (UE4M3) at 0, qs[32] at 4; unit j = sub-blocks 2j and 2j+1, sub-block s's codes at qs[8s .. 8s+8):
         // byte k holds value k (low nibble) and value k + 8 (high nibble).  One fp16 sum per sub-block (own scale).
-        half2 acc1[kNE];
+        half2 acc1[NE];
 #pragma unroll
-        for (int q = 0; q < kNE; q++) acc1[q] = __float2half2_rn(0.0f);
+        for (int q = 0; q < NE; q++) acc1[q] = __float2half2_rn(0.0f);
 #pragma unroll
         for (int h = 0; h < 2; h++) {
 #pragma unroll
             for (int w = 0; w < 2; w++) {
                 const uint32_t qw = u32_at(b16 + 2 + 8 * j + 4 * h + 2 * w);
                 const int i = 8 * h + 2 * w;   // half2 index of value 4w of the sub-block
-                uint32_t lo01, lo23, hi01, hi23;
-                fp4_pairs(qw, lo01, lo23);
-                fp4_pairs(qw >> 4, hi01, hi23);
+                const uint32_t p01 = __byte_perm(qw, 0, 0x4140), p23 = __byte_perm(qw, 0, 0x4342);
+                const uint32_t lo01 = fp4_lo(p01), lo23 = fp4_lo(p23), hi01 = fp4_hi(p01), hi23 = fp4_hi(p23);
                 if (h == 0) {
                     fma_all(lo01, Y, i, acc); fma_all(lo23, Y, i + 1, acc);
                     fma_all(hi01, Y, i + 4, acc); fma_all(hi23, Y, i + 5, acc);
@@ -227,9 +224,10 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
                 }
             }
         }
-        const float f0 = nvfp4_scale(bb[2 * j]), f1 = nvfp4_scale(bb[2 * j + 1]);
+        // the weights are 2^-15 times the doubled value; sc[].x undoes the 2^-24 of the other formats' encoding
+        const float f0 = nvfp4_scale(bb[2 * j]) * 0x1p-9f, f1 = nvfp4_scale(bb[2 * j + 1]) * 0x1p-9f;
 #pragma unroll
-        for (int q = 0; q < kNE; q++)
+        for (int q = 0; q < NE; q++)
             out[q] += (f0 * (__low2float(acc[q]) + __high2float(acc[q])) +
                        f1 * (__low2float(acc1[q]) + __high2float(acc1[q]))) * sc[q].x;
     } else {   // Q2_0: 64 weights per block, code c (2 bits, weight i at bit 2i of qs) means c - 1; unit j = weights 32j..
@@ -243,7 +241,7 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
                 const uint32_t pa = __byte_perm(x, 0, 0x4140);
                 const uint32_t pb = __byte_perm(x, 0, 0x4342);
 #pragma unroll
-                for (int q = 0; q < kNE; q++) {
+                for (int q = 0; q < NE; q++) {
                     const uint32_t* Yw = (const uint32_t*) (Y[q] + 8 * h);
                     const uint32_t ya = __byte_perm(Yw[k / 2], Yw[2 + k / 2], (k & 1) ? 0x7632 : 0x5410);
                     const uint32_t yb = __byte_perm(Yw[4 + k / 2], Yw[6 + k / 2], (k & 1) ? 0x7632 : 0x5410);
@@ -253,7 +251,7 @@ __device__ __forceinline__ void unit_dot(const uint8_t* bb, int j, const Cols& Y
             }
         }
 #pragma unroll
-        for (int q = 0; q < kNE; q++) out[q] += d * fmaf(__low2float(acc[q]) + __high2float(acc[q]), sc[q].x, -sc[q].y);
+        for (int q = 0; q < NE; q++) out[q] += d * fmaf(__low2float(acc[q]) + __high2float(acc[q]), sc[q].x, -sc[q].y);
     }
 }
 
@@ -396,27 +394,34 @@ __device__ __forceinline__ void mm_phase(const LayerArgs& a, const uint4* grp, u
             // the entries' activations: written before this phase's grid barrier and read by every warp of the
             // block, so through the non-coherent L1 path (nothing of them is cached from before the barrier)
             const int b = b0 * UPB + lane;
-            uint4 av[kNE][4];
-            float2 as[kNE];
-            Cols Y;
+            // decode once per unit, dotted with only the group's entries (one entry: half the FMAs and loads)
+            const auto decode = [&](auto ne_c) {
+                constexpr int NE = decltype(ne_c)::value;
+                uint4 av[NE][4];
+                float2 as[NE];
+                Cols<NE> Y;
 #pragma unroll
-            for (int q = 0; q < kNE; q++) {
-                const int col = by_tok ? (int) ((m.toks >> (8 * min(q, m.ne - 1))) & 0xffu) : m.e0 + min(q, m.ne - 1);
-                const uint4* yp = (const uint4*) (y + (int64_t) col * n_in + 32 * b);
+                for (int q = 0; q < NE; q++) {
+                    const int col = by_tok ? (int) ((m.toks >> (8 * q)) & 0xffu) : m.e0 + q;
+                    const uint4* yp = (const uint4*) (y + (int64_t) col * n_in + 32 * b);
 #pragma unroll
-                for (int k = 0; k < 4; k++) av[q][k] = __ldg(yp + k);
-                as[q] = __ldg(ys + (int64_t) col * nb32 + b);
-                Y[q] = (const half2*) av[q];
-            }
+                    for (int k = 0; k < 4; k++) av[q][k] = __ldg(yp + k);
+                    as[q] = __ldg(ys + (int64_t) col * nb32 + b);
+                    Y[q] = (const half2*) av[q];
+                }
 #pragma unroll
-            for (int r = 0; r < RT; r++) {
-                float o[kNE];
+                for (int r = 0; r < RT; r++) {
+                    float o[NE];
 #pragma unroll
-                for (int q = 0; q < kNE; q++) o[q] = 0.0f;
-                unit_dot<TY>((const uint8_t*) (stage + r * S::CW) + bi * S::BS, j, Y, as, grid, sgn, o);
+                    for (int q = 0; q < NE; q++) o[q] = 0.0f;
+                    unit_dot<TY>((const uint8_t*) (stage + r * S::CW) + bi * S::BS, j, Y, as, grid, sgn, o);
 #pragma unroll
-                for (int q = 0; q < kNE; q++) sum[q][r] += o[q];
-            }
+                    for (int q = 0; q < NE; q++) sum[q][r] += o[q];
+                }
+            };
+            static_assert(kNE == 2, "the decode dispatch handles groups of 1 or 2 entries");
+            if (m.ne == 1) decode(std::integral_constant<int, 1>{});
+            else           decode(std::integral_constant<int, 2>{});
         }
         if (c == nchunk - 1) {
 #pragma unroll
