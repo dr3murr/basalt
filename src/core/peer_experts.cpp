@@ -7,6 +7,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -42,7 +43,7 @@ struct Meta {                           // one block, uploaded with one copy per
 };
 
 // fp16 -> fp32 times s, n a multiple of 8 (the result rows are n_embd wide)
-__attribute__((target("avx,f16c"))) static void halves_to_floats(const uint16_t* src, float s, float* dst, int64_t n) {
+BASALT_TARGET_AVX2_FMA_F16C static void halves_to_floats(const uint16_t* src, float s, float* dst, int64_t n) {
     const __m256 vs = _mm256_set1_ps(s);
     for (int64_t i = 0; i < n; i += 8)
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (src + i))), vs));
