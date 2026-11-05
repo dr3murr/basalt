@@ -31,6 +31,7 @@
 #include "basalt/core/layout.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/core/staged_copy.hpp"
+#include "basalt/core/swap_staging.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/core/weights.hpp"
 #include "basalt/core/model_file.hpp"
@@ -111,6 +112,15 @@ using engine_local::drive_pool_split;
 using engine_local::kSatBoost;
 using engine_local::peer_hot_share_order;
 using Clock = std::chrono::steady_clock;
+
+/// Adds the scope's time to --profile's host gap `gap` (DecodeGaps::hms).
+struct GapSpan {
+    int gap;
+    Clock::time_point t0 = Clock::now();
+    ~GapSpan() {
+        basalt::core::decode_gaps().hms[gap] += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    }
+};
 
 // ---- --serve's conversation cache.  A chat or an agent sends the whole conversation again with every request, and
 // reading it again would make a long session wait for every turn.  What a sequence leaves behind splits in
@@ -297,7 +307,15 @@ private:
     std::vector<int32_t> prof_rank{};
     bool adapt_fast{};
     float fast_decay{};
-    struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; bool xchg, promo, p2p; };
+    // `evict_to`: the eviction's RAM place when its copy goes through a bounce slot (xq_queue_evictions), else null;
+    // `from`: the incoming expert's RAM bytes, read at step (2)
+    struct XSwap {
+        int32_t layer, in, out, lout, slot;
+        uint64_t off;
+        bool xchg, promo, p2p;
+        uint8_t* evict_to;
+        const uint8_t* from;
+    };
     bool peer_excl{};
     bool xq_across{};
     std::vector<XSwap> xq{};
@@ -313,6 +331,16 @@ private:
     uint32_t xq_no{};
     bool xq_words{};
     uint32_t* xq_pin{};
+    // A RAM copy with pageable places (the driver did not page-lock all of it): a round's copies with such a place go
+    // through these pinned slots in turn, on xq_thr (xq_queue_evictions, xq_queue_incoming)
+    static constexpr int kXqBounceSlots = 16;
+    basalt::core::SwapStaging xq_bounce{};
+    std::string xq_copy_err{};   ///< a failure of xq_thr's copies, reported when they are joined
+    // --profile's host gaps (DecodeGaps::hms, named in Verifier::profile_report): xq_thr's busy time, the time a step
+    // waits for it, each step's own time (the round (1), the evictions landed (2), the incoming landed (3)), and in
+    // step (3) the wait for the promotions' copies out of the peer and the refills of their peer slots
+    static constexpr int kGapCopier = 21, kGapCopierWait = 22, kGapSwapRound = 23, kGapSwapStep2 = 24,
+                         kGapSwapStep3 = 25, kGapSwapP2pWait = 26, kGapSwapReassign = 27;
     cudaEvent_t p2p_ev{};
     bool xq_unsettled{};
     std::vector<std::pair<int32_t, int32_t>> xq_released{};
@@ -463,6 +491,11 @@ private:
     double ba_ms{};
     JobRunner ba_thr{};   // queues the adaptive copies beside the windows
     bool ba_job{};
+    // A round's copies that touch pageable RAM: such a copy holds the thread that issues it, and the driver holds other
+    // threads' CUDA calls meanwhile, so they are issued here, beside the window, through the bounce slots.  Declared
+    // after the tiers and slots its copies use, so it is joined before they go.
+    JobRunner xq_thr{};
+    bool xq_job{};
     double bt_run{};
     double bt_commit{};
     double bt_emit{};
@@ -528,6 +561,11 @@ private:
     void rank_once(std::vector<Swap>& swaps, size_t room);
     bool adapt();
     void xq_settle();
+    /// waits for the copies on xq_thr: their DMAs all queued, adapt_ev recorded after them (false: they failed)
+    bool xq_join_copies();
+    void xq_hand_off(std::function<void()> job);
+    void xq_queue_evictions();
+    void xq_queue_incoming(const uint32_t* words);
     bool xq_round(std::vector<Swap>* ranked = nullptr);
     bool xq_advance(bool wait);
     bool xq_drain();

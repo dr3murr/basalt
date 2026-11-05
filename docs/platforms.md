@@ -42,6 +42,11 @@ system's long-path policy on or off.
 - Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
   the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
   start-up note says what was capped.
+- The resident expert copy (`resident-experts`) is usually larger than the driver will page-lock
+  under WDDM, so it is locked in the working set instead (the start-up note says "page-locking
+  refused"). The GPU then cannot read its experts over PCIe, and the adaptive swaps' copies to and
+  from it go through small pinned slots (`include/basalt/core/swap_staging.hpp`) on a copier
+  thread beside the decode window, instead of holding the decode loop while the driver stages them.
 - Large pages need the "Lock pages in memory" privilege, which is granted to Administrators by
   default; locking the resident expert copy needs "Increase a process working set", which is
   granted to Users, so it works without elevation. The engine enables whichever its token holds.

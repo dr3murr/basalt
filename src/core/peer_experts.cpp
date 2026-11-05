@@ -404,6 +404,16 @@ bool PeerExperts::finish(float* out, std::string& err) {
     return true;
 }
 
+void PeerExperts::set_exclusive(FileExpertSource* fsrc) {
+    fsrc_ = fsrc;
+    if (fsrc_ == nullptr || !fsrc_->has_pageable_places()) return;
+    On on(device_);
+    const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
+    std::string err;
+    if (!bounce_.reserve(kBounceSlots, blob, err) || !refill_bounce_.reserve(kRefillSlots, blob, err))
+        basalt::log::warn("basalt", "peer experts: swaps copy straight from pageable RAM: %s", err.c_str());
+}
+
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
     if (!evicting_.empty() || max_swaps <= 0) return true;
     // a Pascal card's link is narrow: one round in flight, so its copies never queue behind another's
@@ -453,16 +463,21 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
             const int32_t slot = res_[(size_t) (s.layer * n_expert_ + s.out)];
             if (slot < 0 || !fsrc_->has_resident(s.layer, s.in)) continue;
             uint64_t off = kHasPlace;
+            uint8_t* to = nullptr;
             if (!fsrc_->has_resident(s.layer, s.out)) {
                 uint8_t* dst = fsrc_->spare_take(s.layer, off);
                 if (dst == nullptr) continue;
-                if (!ck(cudaMemcpyAsync(dst, cache_.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
+                const size_t bytes = (size_t) lay.blob_bytes(s.layer);
+                // a pageable place: the copy lands in the swap's pinned slot, and issue_pending moves it into the place
+                const int k = (int) evicting_.size();
+                if (k < bounce_.slots() && !fsrc_->place_pinned(off, bytes)) to = dst;
+                if (!ck(cudaMemcpyAsync(to != nullptr ? bounce_.slot(k) : dst, cache_.device_slot(slot), bytes,
                                         cudaMemcpyDeviceToHost, refill_), "evict", err)) {
                     fsrc_->spare_return(s.layer, off);
                     return false;
                 }
             }
-            evicting_.push_back({s.layer, s.in, s.out, slot, off});
+            evicting_.push_back({s.layer, s.in, s.out, slot, off, to});
         }
         return evicting_.empty() || ck(cudaEventRecord(evict_ev_, refill_), "evict event", err);
     }
@@ -500,10 +515,20 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out,
         if (p.second == slot) return true;
     for (const Evict& x : evicting_)
         if (x.slot == slot) return true;
-    const auto& lay = basalt::kernels::cpu::expert_layout();
+    const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(lout);
     On on(device_);
-    if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(lout), cudaMemcpyHostToDevice,
-                            refill_), "reassign", err))
+    // a pageable blob goes through the next refill slot, once the copy out of it last time has run
+    const uint8_t* from = blob;
+    int s = -1;
+    if (refill_bounce_.slots() > 0 && !src_->pinned(lout, out)) {
+        s = refill_turn_;
+        refill_turn_ = (refill_turn_ + 1) % refill_bounce_.slots();
+        if (!refill_bounce_.wait(s, err)) return false;
+        std::memcpy(refill_bounce_.slot(s), blob, bytes);
+        from = refill_bounce_.slot(s);
+    }
+    if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), from, bytes, cudaMemcpyHostToDevice, refill_), "reassign", err) ||
+        (s >= 0 && !refill_bounce_.queued(s, refill_, err)))
         return false;
     pending_.emplace_back((int32_t) i_out, slot);
     ++swaps_;
@@ -656,23 +681,32 @@ bool PeerExperts::issue_pending(bool wait) {
     On on(device_);
     if (wait) cudaEventSynchronize(evict_ev_);
     else if (cudaEventQuery(evict_ev_) != cudaSuccess) return false;
-    // the victims are in RAM now: they are computed from there while their slots take the incoming experts
+    // the victims are in RAM now: they are computed from there while their slots take the incoming experts.
+    // evict_ev_ follows every copy queued on refill_ before it, so the bounce slots are free for the host here: this
+    // round's victims are in them, and the last round's refills out of them have run
     const auto& lay = basalt::kernels::cpu::expert_layout();
-    for (const Evict& x : evicting_) {
+    for (size_t k = 0; k < evicting_.size(); ++k) {
+        const Evict& x = evicting_[k];
         const bool placed = x.off == kHasPlace;
         // the slot may have been reassigned or its victim promoted since the round was planned
         if (res_[(size_t) (x.layer * n_expert_ + x.out)] != x.slot || (placed && !fsrc_->has_resident(x.layer, x.out))) {
             if (!placed) fsrc_->spare_return(x.layer, x.off);
             continue;
         }
+        const size_t bytes = (size_t) lay.blob_bytes(x.layer);
+        if (x.to != nullptr) std::memcpy(x.to, bounce_.slot((int) k), bytes);
         const uint8_t* b = src_->blob(x.layer, x.in);
         if (!placed && !fsrc_->spare_land(x.layer, x.out, x.off)) {
             fsrc_->spare_return(x.layer, x.off);   // the victim got a place meanwhile: try again next round
             continue;
         }
+        // a pageable incoming expert goes through the same slot, its victim being out of it
+        if (b != nullptr && (int) k < bounce_.slots() && !src_->pinned(x.layer, x.in)) {
+            std::memcpy(bounce_.slot((int) k), b, bytes);
+            b = bounce_.slot((int) k);
+        }
         if (b == nullptr ||
-            cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
-                            refill_) != cudaSuccess) {
+            cudaMemcpyAsync(cache_.device_slot(x.slot), b, bytes, cudaMemcpyHostToDevice, refill_) != cudaSuccess) {
             basalt::log::warn("basalt", "peer experts: an exclusive swap failed (layer %d, expert %d)", (int) x.layer,
                          (int) x.in);
             continue;

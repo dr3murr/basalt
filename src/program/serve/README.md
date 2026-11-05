@@ -28,6 +28,7 @@ serving; `Flow::quit` runs shutdown and flushes the disk cache.
 | RAM admission and VRAM controls | `memory.cpp` |
 | Elastic KV and cache resizing | `kv.cpp` |
 | Expert adaptation and exchanges | `tiers.cpp` |
+| Adaptive swap copies with pageable RAM (bounce slots) | `swap_copies.cpp` |
 | Profile persistence and probe adaptation | `tier_profile.cpp` |
 | Batch windows and initialization | `batch.cpp` |
 | Slot sessions and state transfers | `slots.cpp` |

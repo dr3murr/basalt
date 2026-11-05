@@ -54,7 +54,9 @@ std::string Verifier::profile_report() {
         static const char* hn[32] = {"peer/copy sync", "profile read", "host sample", "run tail", "commit", "emit",
                                      "draft stage", "draft launch", "draft wait", "draft sync", "draft prof read",
                                      "run entry", "stage+ple", "dm_sync", "peer launch", "graph launch",
-                                     "adapt join", "observe", "apply_pending", "window/penalty", "adapt thread", "", "", "", "", "", "", "", "commit GPU",
+                                     "adapt join", "observe", "apply_pending", "window/penalty", "adapt thread",
+                                     "swap copier", "swap copier wait", "swap round", "swap step 2", "swap step 3",
+                                     "swap p2p wait", "swap reassign", "commit GPU",
                                      "commit>draft", "verify>commit", ""};
         out += " | host ms/window:";
         for (int i = 0; i < 31; ++i) {

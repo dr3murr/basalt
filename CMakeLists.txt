@@ -329,7 +329,8 @@ add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/exper
   src/core/mtp/draft.cpp
   src/core/mtp/stores.cpp
   src/core/mtp/batching.cpp
-  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
+  src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/conversation_store.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp
+  src/core/swap_staging.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 # The Pascal (sm_60) expert tier: its kernels come from a CUDA 12 nvcc (CUDA 13 compiles nothing older than sm_75)
@@ -545,6 +546,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/serve/request_restore.cpp
                        src/program/serve/runtime.cpp
                        src/program/serve/slots.cpp
+                       src/program/serve/swap_copies.cpp
                        src/program/serve/tier_profile.cpp
                        src/program/serve/tiers.cpp
                        src/program/serve/verify.cpp

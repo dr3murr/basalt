@@ -194,7 +194,8 @@ bool Runtime::batch_step() {
         if (ba_job && ba_thr.finished()) { ba_thr.join(); ba_job = false; }
         if (!ba_job) {
             if (xq_stage != 0) {
-                if (cudaEventQuery(adapt_ev) == cudaSuccess) {
+                // xq_thr's copies record adapt_ev once all are queued; before that it holds an older record
+                if ((!xq_job || xq_thr.finished()) && cudaEventQuery(adapt_ev) == cudaSuccess) {
                     const int was = xq_stage;
                     ok = xq_advance(true);
                     if (ok && was == 1 && xq_stage == 2) {

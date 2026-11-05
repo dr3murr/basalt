@@ -511,6 +511,12 @@ public:
     bool spare_release(int64_t layer, int64_t in);
     /// A place `spare_take` gave, unused.
     void spare_return(int64_t layer, uint64_t off);
+    /// Whether the place at `off` (`bytes` long) is page-locked: a copy between it and a GPU is then a DMA the call
+    /// only queues.
+    bool place_pinned(uint64_t off, uint64_t bytes) const;
+    /// Some places of the copy are pageable (the driver did not page-lock all of it): their swap copies go through
+    /// pinned slots (SwapStaging).
+    bool has_pageable_places() const { return complement_ready_ && pinned_bytes() < complement_bytes_; }
     /// After loading, before any reader runs: keeps more experts in RAM, in a second region placed after the first
     /// in the offset space, hottest first (`rank`) as far as available RAM less the RAM margin allows.  `skip(l, e)`
     /// names experts a GPU holds.  `later` is RAM still to be taken after this, kept free too.  Returns the bytes added

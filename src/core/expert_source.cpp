@@ -1723,15 +1723,19 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return false;
-    if (complement_offsets_[index] >= homes_start()) {
-        const int r = detail::home_region_find(homes_, complement_offsets_[index], layer_blob_bytes_[(size_t) layer]);
+    return place_pinned(complement_offsets_[index], layer_blob_bytes_[(size_t) layer]);
+}
+
+bool FileExpertSource::place_pinned(uint64_t off, uint64_t bytes) const {
+    if (!complement_ready_) return false;
+    if (off >= homes_start()) {
+        const int r = detail::home_region_find(homes_, off, bytes);
         return r >= 0 && homes_[(size_t) r].pinned;
     }
-    if (complement_offsets_[index] >= complement_bytes_) return top_pinned_;
+    if (off >= complement_bytes_) return top_pinned_;
     if (!complement_pinned_ || complement_host_ == nullptr) return false;
     // a partial pin (CS-T): only the registered prefix
-    return !complement_partial_ ||
-           complement_offsets_[index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
+    return !complement_partial_ || off + bytes <= complement_pin_limit_;
 }
 
 void FileExpertSource::repin_join() {

@@ -347,6 +347,7 @@ void Runtime::xq_settle() {
 
 // `ranked`: the round's ranking already made (rank_swaps reads nothing xq_settle changes)
 bool Runtime::xq_round(std::vector<Swap>* ranked) {
+    const GapSpan span{kGapSwapRound};
     xq_settle();
     std::vector<Swap> swaps;
     if (ranked != nullptr) swaps.swap(*ranked);
@@ -387,11 +388,15 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
         const bool xchg = src.complement_ready() && (p2p || src.has_resident(s.layer, s.in)) &&
                           !src.has_resident(s.lout, s.out);
         uint64_t off = 0;
+        uint8_t* evict_to = nullptr;
         if (xchg) {
             uint8_t* dst = src.spare_take(s.lout, off);
             if (dst == nullptr) { ++n_noplace; return true; }   // no free place: a later round
-            if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.lout),
-                                cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
+            const size_t bytes = (size_t) lay.blob_bytes(s.lout);
+            if (xq_bounce.slots() > 0 && !src.place_pinned(off, bytes)) {
+                evict_to = dst;   // a pageable place: xq_queue_evictions copies it there through a bounce slot
+            } else if (cudaMemcpyAsync(dst, xcache.device_slot(slot), bytes, cudaMemcpyDeviceToHost, adapt_stream) !=
+                       cudaSuccess) {
                 basalt::log::error("basalt serve", "an eviction copy failed (layer %d, slot %d): %s",
                              (int) s.lout, (int) slot, cudaGetErrorString(cudaGetLastError()));
                 return false;
@@ -399,7 +404,7 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
         }
         if (p2p) peer.hold(s.layer, s.in);
         xq.push_back({s.layer, s.in, s.out, s.lout, slot, off, xchg,
-                      peer.valid() && peer.has(s.layer, s.in), p2p});
+                      peer.valid() && peer.has(s.layer, s.in), p2p, evict_to, nullptr});
         return true;
     };
     const size_t n_base = std::min(swaps.size(), base);
@@ -431,8 +436,11 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
     xq_swapped += (int64_t) xq.size();
     xq_noplace += (int64_t) n_noplace;
     if (!xq.empty()) {
-        cudaEventRecord(adapt_ev, adapt_stream);
         xq_stage = 1;
+        if (std::any_of(xq.begin(), xq.end(), [](const XSwap& x) { return x.evict_to != nullptr; }))
+            xq_hand_off([this] { xq_queue_evictions(); });   // it records adapt_ev after them
+        else
+            cudaEventRecord(adapt_ev, adapt_stream);
     }
     for (float& v : drive.d.usage) v *= fast_decay;
     return true;
@@ -441,6 +449,9 @@ bool Runtime::xq_round(std::vector<Swap>* ranked) {
 // `wait`: step (3) waits for the copies even with the landed words (the batch windows, a drain)
 bool Runtime::xq_advance(bool wait) {
     if (xq_stage == 0) return true;
+    const GapSpan span{xq_stage == 1 ? kGapSwapStep2 : kGapSwapStep3};
+    // the stage's copies on xq_thr first: until they are all queued, adapt_ev holds an older record
+    if (!xq_join_copies()) return false;
     if (xq_stage == 2) ver.flush_post_launch();
     const bool nowait = xq_stage == 2 && xq_words && !wait;
     if (!nowait) cudaEventSynchronize(adapt_ev);
@@ -460,7 +471,7 @@ bool Runtime::xq_advance(bool wait) {
             ver.dm_fence(adapt_stream);
         }
         bool deferred = false, p2p = false;
-        for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
+        for (XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
             std::string perr;
             if (x.p2p) {
                 if (!peer.copy_to(x.layer, x.in, xcache.device_slot(x.slot), adapt_stream, perr)) {
@@ -470,6 +481,8 @@ bool Runtime::xq_advance(bool wait) {
                 p2p = true;
                 continue;
             }
+            // read here, between windows (blob counts the reads; the copies may run beside the window's own)
+            x.from = srcp->blob(x.layer, x.in);
             deferred = true;
         }
         if (p2p) cudaEventRecord(p2p_ev, adapt_stream);
@@ -492,33 +505,13 @@ bool Runtime::xq_advance(bool wait) {
             pw = w;
         }
         if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
-            auto copies = [&, pw] {
-                const auto& lay2 = basalt::kernels::cpu::expert_layout();
-                std::vector<uint32_t> ord;   // layer order: a layer's word goes up right after its own copies
-                for (uint32_t i = 0; i < (uint32_t) xq.size(); ++i)
-                    if (!xq[i].p2p) ord.push_back(i);
-                std::stable_sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) { return xq[a].layer < xq[b].layer; });
-                for (size_t k = 0; k < ord.size(); ++k) {
-                    const XSwap& x = xq[ord[k]];
-                    const uint8_t* b = srcp->blob(x.layer, x.in);
-                    if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
-                                                        cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
-                        basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
-                                     (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));
-                    if (pw != nullptr && (k + 1 == ord.size() || xq[ord[k + 1]].layer != x.layer) &&
-                        cudaMemcpyAsync(ver.landed_words() + x.layer, pw + g.n_layers, 4, cudaMemcpyHostToDevice,
-                                        adapt_stream) != cudaSuccess)
-                        basalt::log::warn("basalt serve", "the landed word's copy failed (layer %d): %s", (int) x.layer,
-                                     cudaGetErrorString(cudaGetLastError()));
-                }
-                cudaEventRecord(adapt_ev, adapt_stream);
-            };
-            // a copy from pageable RAM holds the calling thread until the copy runs, and a window launched ahead of it
-            // waits for that thread to serve its rings: such a round's copies are queued here, before the window
+            // a round whose RAM copies are all pinned queues them on the window's thread right after its launch; one
+            // with pageable sources queues them on xq_thr through the bounce slots, so the window launches at once
+            // (the landed words order them per layer)
             if (std::all_of(xq.begin(), xq.end(), [&](const XSwap& x) { return x.p2p || srcp->pinned(x.layer, x.in); }))
-                ver.set_post_launch(std::move(copies));
+                ver.set_post_launch([this, pw] { xq_queue_incoming(pw); });
             else
-                copies();
+                xq_hand_off([this, pw] { xq_queue_incoming(pw); });
         } else {
             cudaEventRecord(adapt_ev, adapt_stream);
         }
@@ -527,8 +520,10 @@ bool Runtime::xq_advance(bool wait) {
     }
     // with the landed words the incoming experts are resident from the next window on while their copies land:
     // its gate/up launches wait for them, and what needs them done waits in xq_settle
-    if (nowait && std::any_of(xq.begin(), xq.end(), [](const XSwap& x) { return x.p2p; }))
+    if (nowait && std::any_of(xq.begin(), xq.end(), [](const XSwap& x) { return x.p2p; })) {
+        const GapSpan span{kGapSwapP2pWait};
         cudaEventSynchronize(p2p_ev);   // a promotion's peer slot is refilled below
+    }
     for (const XSwap& x : xq) {
         host_res[(size_t) x.layer * g.n_expert + x.in] = x.slot;
         if (x.xchg && !x.p2p) src.spare_release(x.layer, x.in);
@@ -545,6 +540,7 @@ bool Runtime::xq_advance(bool wait) {
     } else {
         res_upload();
     }
+    const GapSpan reassign_span{kGapSwapReassign};
     for (const XSwap& x : xq) {   // a promoted expert's peer slot takes the one CUDA0 gave up, from any layer
         if (!x.promo) continue;
         std::string perr;
@@ -633,6 +629,12 @@ int Runtime::init_tiers() {
             cudaSuccess) {
         cudaGetLastError();
         xq_pin = nullptr;
+    }
+    // a RAM copy with pageable places: the rounds' copies with them go through pinned slots (swap_copies.cpp)
+    if (adapt_fast && !drive.d.usage.empty() && src.has_pageable_places()) {
+        std::string serr;
+        if (!xq_bounce.reserve(kXqBounceSlots, basalt::kernels::cpu::expert_layout().max_blob, serr))
+            basalt::log::warn("basalt serve", "adaptive swaps copy straight from pageable RAM: %s", serr.c_str());
     }
     p2p_ev = nullptr;   // the copies out of the peer's slots, which a promotion's reassign refills
     cudaEventCreateWithFlags(&p2p_ev, cudaEventDisableTiming);

@@ -18,6 +18,7 @@
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pascal_peer.hpp"
+#include "basalt/core/swap_staging.hpp"
 
 #include <cuda_runtime.h>
 
@@ -118,8 +119,9 @@ public:
     std::vector<size_t> incoming() const;
     /// --peer-exclusive, once the RAM copy is built: the peer's experts have no RAM place.  Swaps then keep every
     /// expert somewhere: an evicted one goes to a free RAM place before its slot is reused, and a RAM place is freed
-    /// once its expert is resident on the peer.  Nothing is read from the file for them.
-    void set_exclusive(FileExpertSource* fsrc) { fsrc_ = fsrc; }
+    /// once its expert is resident on the peer.  Nothing is read from the file for them.  A swap whose RAM place is
+    /// pageable copies through the peer's pinned slots (SwapStaging).
+    void set_exclusive(FileExpertSource* fsrc);
     bool exclusive() const { return fsrc_ != nullptr; }
     /// Keeps (layer, expert) in its slot (adapt does not evict it) until `reassign` takes the slot: its bytes are
     /// being copied out.
@@ -156,9 +158,17 @@ private:
     std::thread wake_thread_;                          ///< `wake` with `ready`: its copies
     bool wake_failed_ = false;
     std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
-    /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one
+    /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one.  `to` is that
+    /// place's host address when the copy goes through the bounce slot of the swap's index in evicting_ (else null)
     static constexpr uint64_t kHasPlace = ~0ull;
-    struct Evict { int32_t layer, in, out, slot; uint64_t off; };
+    struct Evict { int32_t layer, in, out, slot; uint64_t off; uint8_t* to; };
+    /// pinned slots for a round's swaps with a pageable RAM place (a Pascal round has 2); later ones copy directly
+    static constexpr int kBounceSlots = 8;
+    SwapStaging bounce_;
+    /// pinned slots `reassign` takes in turn for a pageable blob (each once the copy out of it last time has run)
+    static constexpr int kRefillSlots = 8;
+    SwapStaging refill_bounce_;
+    int refill_turn_ = 0;
     std::vector<Evict> evicting_;                     ///< exclusive swaps whose victim is still being copied to RAM
     cudaEvent_t evict_ev_ = nullptr;
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
