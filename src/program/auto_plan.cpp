@@ -54,13 +54,15 @@ AutoPlan choose_auto(const AutoInputs& in) {
     const AutoGiven& g = in.given;
     AutoPlan p;
 
-    // Peer-exclusive only when the full complement does not fit and holding the peer's experts only on the peer
-    // leaves nothing to read from the SSD.
+    // Peer-exclusive when the full complement does not fit and either the exclusive one does (nothing left to read from
+    // the SSD) or the prompt path would not use the peer's RAM copies anyway (a Pascal tier): holding the peer's experts
+    // only there then frees their RAM for the next-ranked experts.
     if (g.peer_exclusive) {
         p.peer_exclusive = g.peer_exclusive_value;
         p.peer_exclusive_src = AutoSource::Given;
     } else {
-        p.peer_exclusive = in.peer && in.serve && !fits(in.complement_full, in) && fits(in.complement_peer_excl, in);
+        p.peer_exclusive = in.peer && in.serve && !fits(in.complement_full, in) &&
+                           (fits(in.complement_peer_excl, in) || !in.peer_prompt_split);
     }
 
     // Resident: what fits, capped at the complement and its optional copies.

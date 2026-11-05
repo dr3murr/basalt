@@ -64,6 +64,22 @@ int main() {
         in.complement_peer_excl = 55 * G;
         CHECK(!choose_auto(in).peer_exclusive);
     }
+    // A peer the prompt path does not split over (a Pascal tier): exclusive as soon as the full complement does not fit,
+    // since the peer's RAM copies would only crowd out the next-ranked experts; everything fitting still keeps it off.
+    {
+        AutoInputs in = base(32, true);             // 28 - 6 = 22: neither the full 60 nor the exclusive 40 fits
+        in.peer_prompt_split = false;
+        AutoPlan p = choose_auto(in);
+        CHECK(p.peer_exclusive);
+        CHECK_STR(auto_flags_line(p), "auto flags: peer-exclusive on, resident 22.0 GB, pool-affinity auto, pool-workers 15");
+        in = base(64, true);
+        in.complement_peer_excl = 55 * G;           // the exclusive complement still leaves reads
+        in.peer_prompt_split = false;
+        CHECK(choose_auto(in).peer_exclusive);
+        in = base(128, true);                       // everything fits: the copies cost nothing
+        in.peer_prompt_split = false;
+        CHECK(!choose_auto(in).peer_exclusive);
+    }
     // CPU shapes.
     {
         AutoInputs in = base(128, false);

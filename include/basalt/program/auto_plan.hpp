@@ -28,6 +28,7 @@ struct AutoInputs {
     std::vector<uint64_t> vram_free;      ///< bytes per card, card 0 first
     bool peer = false;                    ///< a second card serves as the peer expert tier
     bool serve = false;                   ///< peer-exclusive needs the serving mode
+    bool peer_prompt_split = true;        ///< the prompt path would split over the peer (needs the peer's RAM copy)
     // CPU topology: worker_cores = cores left for pool workers once the host thread has its own.
     int worker_cores = 1;
     int p_cores = 0;

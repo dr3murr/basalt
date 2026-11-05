@@ -206,6 +206,7 @@ int resident_plan(Context& context) {
             in.ram_available = in.ram_available > 0 ? std::min(in.ram_available, hm.available) : hm.available;
         in.peer = o.peer_devices.size() == 1 && o.resident_cpu_experts;   // peer-exclusive: one tier card
         in.serve = o.serve;
+        in.peer_prompt_split = context.split_want == nullptr || *context.split_want;
         in.worker_cores = (int) topo.worker_cores.size();
         in.p_cores = topo.p_cores;
         in.e_cores = topo.e_cores;
