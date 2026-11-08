@@ -56,10 +56,11 @@ output, prose).
 | Windows 11, RTX 5080 + P100 (6e4cc31, `--peer-exclusive`, 55 GB RAM free, mean of 3 runs) | 116 | 187 | 112 | [K], [L], [C:6e4cc31] |
 
 On Linux the P100 adds +49% (conv), +142% (struct) and +53% (prose) [R]. Windows with the P100 reaches 95%, 93% and
-92% of the Linux figures (computed from the table). Struct, whose drafts are accepted almost every time (98% in the
-Windows logs [L]), gains the most. The Linux struct figure of 201 is the bench table's number, which reads high on
-struct; measured as time per decode window, Windows (41.6 ms) and Linux (41.65 ms, commit 98f6932) are equal on
-struct [S:0fcf3c47], [R].
+92% of the Linux figures (computed from the table), but those two rows come from different builds (Windows 6e4cc31,
+Linux 11f2e5b). Struct, whose drafts are accepted almost every time (98% in the Windows logs [L]), gains the most. The
+Linux struct figure of 201 is the bench table's number, which reads high on struct. Measured as time per decode window
+on comparable builds (Windows 6e4cc31, Linux 98f6932), Windows takes about 11% longer on conv (23.80 vs 21.46 ms) and
+7% longer on prose (19.54 vs 18.23 ms), and the two are equal on struct (41.6 vs 41.65 ms) [S:0fcf3c47], [L], [R].
 
 The Linux rows were measured while the P2P-patched 580.173.02 driver was loaded; Basalt does not use P2P (see
 [Driver setup: Linux](#driver-setup-linux)). On the stock 580.196.07 package with the coexistence option below, a
@@ -183,7 +184,8 @@ The P100 follows the conversation like the main card's cache, with rules for its
   resident expert copy stays pageable and each swap copy held the decode loop while the driver staged it. Swap copies
   with a pageable RAM side now go through small pinned slots (`include/basalt/core/swap_staging.hpp`); the P100's
   evictions, refills and promotion refills use slots of their own, and the main card's copies run on a copier thread
-  beside the decode window. Windows decode went from 92/173/90 to 116/187/112 t/s [C:6e4cc31].
+  beside the decode window. Windows decode went from 91/172/89 to 116/187/112 t/s (the f14e879 and 6e4cc31 rows of
+  the [Windows](#windows) table).
 
 ### Prompt processing
 
@@ -296,7 +298,8 @@ cmake --build build -j
 **Linux check of this branch (2026-11-08): compiled, CPU tests only.** A fresh clone of commit 3320e3e was built in
 WSL2 (Ubuntu 24.04) with GCC 13.3, CUDA 13.4 for sm_120 and CUDA 12.9's nvcc for the cubin
 (`-DBASALT_PASCAL_NVCC=<12.9 nvcc> -DBASALT_PASCAL_CCBIN=/usr/bin/g++-13`), with the options of upstream's Linux CI job
-(`-G Ninja -DWERROR=ON -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES=120`, Python 3.12 with `requirements.txt`):
+(`-G Ninja -DWERROR=ON -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES=120`, Python 3.12 with `requirements-test.txt`,
+which pulls in `requirements.txt`, and pytest):
 
 - All 630 build steps succeeded. No compiler warnings in the project's sources; CUDA 12.9's nvcc printed two for the
   cubin (#177-D: the `NS` members of `Fmt<kIQ4_NL>` and `Fmt<kQ2_0>` are never referenced), which `WERROR` does not
@@ -520,6 +523,10 @@ flags worked only with `ld.acquire.sys`; `ld.global.cv` never saw the update [R]
 - The headline Linux numbers were taken with the P2P-patched 580.173.02 loaded, not with the stock 580.196.07 setup
   this document recommends; the stock setup was checked with a served request (124.9 t/s) and the 32 GB runs
   [S:ba873ef6], [R].
+- On Linux the 5080 crashed twice on 2026-11-03 on the proprietary 580.173.02 driver: `Xid 62` (PMU halt), then
+  `Xid 154` (GPU reset required), both while it sat idle at a bare text console. The likely cause, not proven, is the
+  driver's idle-display power saving (DIFR). A locally rebuilt `nvidia-modeset` with DIFR turned off (not published)
+  then ran 19.5 hours without an Xid, and none has been seen since the machine runs X, which is not proof [R].
 - Run-to-run noise is about ±3 t/s; free RAM changes results a lot (Windows table).
 - The fp16 kernels round differently from the main card's kernels; results are reproducible run to run only with the
   expert cache pinned (`--expert-cache N`) and the same expert placement [R].
@@ -542,7 +549,7 @@ CUDA 13.3):
 
 ```bat
 set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH%
-bin\basalt-bench.exe --model D:\models\Qwen3.8-FN-NVFP4-DQ6_K.basalt -t conv,struct,prose -r 2 --seed 1 ^
+bin\basalt-bench.exe --model <dir>\Qwen3.8-FN-NVFP4-DQ6_K.basalt -t conv,struct,prose -r 2 --seed 1 ^
     --gpu 0,1 --peer-exclusive --logs DIR -- --decode-timing
 ```
 
@@ -572,7 +579,7 @@ On top of upstream `9595ae0`, oldest first:
 | 98f6932 | the P100's swap round stepped once per window: ms per window -5.0/-4.4/-1.5% |
 | f14e879 | measurement scaffolding removed; result rows always fp16 |
 | 086814a | Windows: MSVC-compatible target attribute for `halves_to_floats` |
-| 6e4cc31 | Windows: swap copies with pageable RAM through pinned slots: 92/173/90 -> 116/187/112 |
+| 6e4cc31 | Windows: swap copies with pageable RAM through pinned slots: 91/172/89 -> 116/187/112 |
 | 375135f | auto plan: peer-exclusive with a Pascal tier whenever the full set does not fit (cherry-pick of b1049ff) |
 
 The other two branches of the fork hold the same work unmerged: `p100-peer` (f14e879 + b1049ff, what the Linux
