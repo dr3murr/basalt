@@ -1,6 +1,6 @@
 # Step 2b: adds the kit's two devices to YOUR copy of the NVIDIA Data Center 582.99 package (extract it with 7-Zip;
-# -DriverDir is its Display.Driver folder). nv_dispwi.inf gets, at the end of [NVIDIA_Devices.NTamd64.10.0...17134]
-# (after the RTX PRO 4000 Blackwell line) and in [Strings]:
+# -DriverDir is its Display.Driver folder). nv_dispwi.inf gets, in [NVIDIA_Devices.NTamd64.10.0...17134] right after
+# the RTX PRO 4000 Blackwell line (DEV_2C34), and in [Strings] right after that card's name:
 #   %NVIDIA_DEV.2C02% = Section094, PCI\VEN_10DE&DEV_2C02    RTX 5080, in the section 582.99 uses for the
 #                                                             RTX PRO 4500/4000 Blackwell (the same GB203 die)
 #   %NVIDIA_DEV.15F8% = Section026, PCI\VEN_10DE&DEV_15F8    any Tesla P100-PCIE-16GB; the stock line matches only

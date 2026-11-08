@@ -22,7 +22,8 @@ yourself; the scripts edit and sign your copy on your machine.
   as GeForce 591.59 do not) with two lines added to `Display.Driver\nv_dispwi.inf`: the RTX 5080 (`DEV_2C02`) mapped
   to the section 582.99 uses for the RTX PRO 4500/4000 Blackwell (the same GB203 die), and a P100 line without a
   subsystem ID (`DEV_15F8`; the stock line matches only subsystem 118F). The GeForce and Data Center `nvlddmkm.sys` of
-  one version are the same code (compared byte for byte on 582.78), so this is an INF change only.
+  one version are the same code (every section identical on 582.78; only the checksum and signature differ), so this
+  is an INF change only.
 - **Signing:** the edited INF breaks the package's catalog. Step 3 or 3e rebuilds `nv_disp.cat`, signs it with a fresh
   local certificate (`signing_cert.ps1`), deletes the certificate's private key and trusts the certificate in
   LocalMachine Root and TrustedPublisher, as NVCleanstall does for its modified drivers. The driver binaries keep
@@ -54,8 +55,8 @@ yourself; the scripts edit and sign your copy on your machine.
 `scripts\patch_inf.ps1 -DriverDir C:\nv58299\Display.Driver` makes it for you and checks the result. It inserts these
 lines into `nv_dispwi.inf` (ASCII, CRLF line ends):
 
-After the line that starts with `%NVIDIA_DEV.2C34.2052.10DE%` (the RTX PRO 4000 Blackwell, last line of the section
-`[NVIDIA_Devices.NTamd64.10.0...17134]`):
+After the line that starts with `%NVIDIA_DEV.2C34.2052.10DE%` (the RTX PRO 4000 Blackwell, near the end of the
+section `[NVIDIA_Devices.NTamd64.10.0...17134]`):
 
 ```
 %NVIDIA_DEV.2C02%           = Section094, PCI\VEN_10DE&DEV_2C02
@@ -114,11 +115,12 @@ every script if you change it.
    and CUDA 13.3 (nvcc, crt, nvvm, thrust/CCCL, cudart, cuBLAS, nvJitLink), toolkit components only; the CUDA
    installers' bundled driver would replace the edited package. CUDA 13 cannot compile sm_60, so 12.9 builds the P100
    tier's cubin, as on Linux. Fails if the display driver is no longer 582.99.
-6. `6_build_basalt.ps1 [-Src <checkout>] [-Build <dir>] [-Jobs N]`: configures with Ninja from a v143 developer shell,
-   builds (the programs land in `<Src>\bin`) and runs the CPU tests. 61 of 63 pass on the test machine, so the script
-   ends with "CPU tests failed" after a complete build ([Known test failures](#known-test-failures)). Then install the
-   server's Python packages where `basalt serve` looks for them:
-   `python -m venv .venv` and `.venv\Scripts\python -m pip install -r requirements.txt` in the checkout.
+6. `6_build_basalt.ps1 [-Src <checkout>] [-Build <dir>] [-Jobs N] [-TestJobs N]`: configures with Ninja from a v143
+   developer shell, builds (the programs land in `<Src>\bin`) and runs the CPU tests. 61 of 63 pass on the test
+   machine, so the script ends with "CPU tests failed" after a complete build
+   ([Known test failures](#known-test-failures)). Then install the server's Python packages where `basalt serve`
+   looks for them: `python -m venv .venv` and `.venv\Scripts\python -m pip install -r requirements.txt` in the
+   checkout.
 7. `7_get_pack.ps1 -Dest <dir>`: downloads `Qwen3.8-FN-NVFP4-DQ6_K.basalt` (131.7 GB, resumable: rerun to continue)
    from Hugging Face and checks its size and SHA-256.
 8. `8_run_basalt.ps1 -Pack <dir>\Qwen3.8-FN-NVFP4-DQ6_K.basalt`: writes `%USERPROFILE%\.config\basalt\flashnext.json`
@@ -135,13 +137,13 @@ you signed yourself without test-signing. It also means:
   driver package (catalog) signing (its extended key usages: Code Signing, Windows Hardware Driver Verification,
   Windows Hardware Driver Extended Verification). Anyone holding the private key could sign software or a driver
   package that this machine then treats as coming from a trusted publisher, without any prompt. It does not make
-  kernel code load: Windows only loads kernel drivers with Microsoft-issued signatures, and none of NVIDIA's binaries
-  are re-signed.
+  kernel code load: with Secure Boot on, Windows loads kernel drivers only with Microsoft-issued signatures, and none
+  of NVIDIA's binaries are re-signed.
 - **The scripts make the key hard to misuse:** it is generated as non-exportable in LocalMachine\My, used once to sign
-  `nv_disp.cat`, and deleted right after (`Remove-Item ... -DeleteKey`). Nothing can sign with it afterwards.
-  NVCleanstall, by comparison, writes its private key to a passwordless .pfx while it signs and never removes its root
-  certificate. The risk left is the window of a few seconds in which the key exists, and an attacker who can read it
-  then already has administrator rights.
+  `nv_disp.cat`, and deleted right after, also when signing fails (`Remove-Item ... -DeleteKey` in a `finally`).
+  Nothing can sign with it afterwards. NVCleanstall, by comparison, writes its private key to a passwordless .pfx
+  while it signs and never removes its root certificate (static analysis of NVCleanstall 1.19.0). The risk left is
+  the few seconds in which the key exists, and an attacker who can read it then already has administrator rights.
 - **The certificate stays trusted for 5 years unless you remove it.** Each run of step 3 or 3e makes a new one and
   records its thumbprint in `<StateDir>\cert-thumbprint.txt`; 3e removes the ones it finds there from earlier runs.
   See them in `certlm.msc` under Trusted Root Certification Authorities and Trusted Publishers.
@@ -233,13 +235,13 @@ built this branch from a fresh clone. The driver scripts were not run again in t
 | `2_remove_current.ps1` | removes the installed NVIDIA display packages | paths |
 | `patch_inf.ps1` | the INF change, byte-exact, with hash checks | new (the test machine's INF was edited with an equivalent Python script) |
 | `signing_cert.ps1` | certificate helpers (dot-sourced) | thumbprint file and subject as parameters; neutral default subject; SDK/WDK tool lookup |
-| `3_install_r580.ps1` | full catalog (Inf2Cat), sign, install, 3b | `-DriverDir`; Inf2Cat/signtool from the Windows Kits folder instead of a bundled copy |
+| `3_install_r580.ps1` | full catalog (Inf2Cat), sign, install, 3b | `-DriverDir`; Inf2Cat/signtool from the Windows Kits folder instead of a bundled copy; private key deleted in a `finally` |
 | `3b_p100_driver_model.ps1` | P100 to MCDM (or WDDM) | none |
-| `3e_reinstall_eac.ps1` | INF-only catalog (makecat), sign, reinstall, 3b | `-DriverDir`, `-StateDir` |
+| `3e_reinstall_eac.ps1` | INF-only catalog (makecat), sign, reinstall, 3b | `-DriverDir`, `-StateDir`; private key deleted in a `finally` |
 | `4_verify.ps1` | device state, driver models, DMA policy, CUDA smoke test | none |
 | `cuda_smoke.py` | 1 GiB allocate/fill/read back per GPU through the driver API | none |
 | `5_install_toolchain.ps1` | MSVC 14.44, CUDA 12.9 and 13.3 toolkit parts | default download folder in `%TEMP%` |
-| `6_build_basalt.ps1` | configure, build, CPU tests | `-Src` defaults to this checkout; `-Build`, `-Jobs` added |
+| `6_build_basalt.ps1` | configure, build, CPU tests | `-Src` defaults to this checkout; `-Build`, `-Jobs`, `-TestJobs` added |
 | `7_get_pack.ps1` | downloads and checks the model pack | replaces `7_prepare_pack.ps1`, which also reformatted that machine's Linux partition as NTFS |
 | `8_run_basalt.ps1` | writes the config, runs `basalt serve` | `-Pack` required |
 | `rollback.ps1` | undoes steps 3/3e (see above) | `-StateDir`; warns when no thumbprints are recorded |

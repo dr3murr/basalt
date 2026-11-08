@@ -30,10 +30,13 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$dir\nv_disp.cat")) { throw "Inf2Ca
 Write-Host '== 2. local signing certificate, trusted in LocalMachine Root + TrustedPublisher'
 $cert = New-CatalogSigningCert $thumbFile $Subject
 
-Write-Host '== 3. sign the catalog, then delete the private key'
-& $Signtool sign /fd sha256 /sm /s My /sha1 $cert.Thumbprint "$dir\nv_disp.cat"
-if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
-Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey
+Write-Host '== 3. sign the catalog, then delete the private key (also when signing fails)'
+try {
+    & $Signtool sign /fd sha256 /sm /s My /sha1 $cert.Thumbprint "$dir\nv_disp.cat"
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+} finally {
+    Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey
+}
 & $Signtool verify /pa /v "$dir\nv_disp.cat" | Select-Object -Last 3
 Write-Host "signed by $($cert.Subject) ($($cert.Thumbprint), recorded in $thumbFile); private key deleted"
 

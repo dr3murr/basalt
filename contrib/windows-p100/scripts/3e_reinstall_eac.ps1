@@ -95,9 +95,12 @@ New-InfOnlyCatalog $cat
 Write-Host '== 2. new certificate, sign, delete its private key'
 $previous = @(Get-Content $thumbFile -ErrorAction SilentlyContinue | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $cert = New-CatalogSigningCert $thumbFile $Subject
-& $signtool sign /fd sha256 /sm /s My /sha1 $cert.Thumbprint $cat
-if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
-Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey
+try {
+    & $signtool sign /fd sha256 /sm /s My /sha1 $cert.Thumbprint $cat
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+} finally {
+    Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey   # also when signing fails
+}
 Write-Host "signed by $($cert.Subject) ($($cert.Thumbprint), recorded in $thumbFile); private key deleted"
 
 Write-Host '== 3. reinstall the package'
