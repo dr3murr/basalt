@@ -72,7 +72,7 @@ wins and is never changed.
 
 | setting | rule |
 | --- | --- |
-| `peer-exclusive` | on only with a peer card and `--serve`, when the full expert set does not fit in free RAM but the set without the peer card's share does; otherwise off. |
+| `peer-exclusive` | on only with a peer card and `--serve`, when the full expert set does not fit in free RAM but the set without the peer card's share does; with a peer card the prompt path does not split over (a Pascal tier, [PASCAL.md](../../PASCAL.md)), whenever the full set does not fit; otherwise off. |
 | `resident` | the free RAM above the safety floor, capped at the experts the GPUs do not hold. |
 | `pool-affinity` | `auto`. |
 | `pool-workers` | the physical cores minus the host thread; on a hybrid CPU with `auto`, the P-cores minus one plus half the E-cores, with `p-cores` the P-cores minus one; fitted to a container CPU quota. |

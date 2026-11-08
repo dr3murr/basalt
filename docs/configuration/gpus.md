@@ -11,7 +11,8 @@ One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in 
 
 Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
 (`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
-too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error.
+too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error;
+in this fork a card after the main one may also be a Pascal card (compute capability 6.x), see below.
 
 The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
 other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)
@@ -27,6 +28,12 @@ expert tier`:
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
   each; see [the GDN split](../precision/gdn-split.md)).
+- **Pascal expert tier** (this fork, [PASCAL.md](../../PASCAL.md)). A Pascal card listed after the main card is an
+  expert tier that computes its rows with its own sm_60 kernels, built by a CUDA 12 nvcc into a cubin the engine
+  embeds (CMake option `BASALT_PASCAL_NVCC`), so its rows differ from the main card's in the last bits. It serves
+  decode windows only: no prompt-chunk share and no prompt-time split. Tested with one Tesla P100 beside an RTX 5080,
+  whose memory is faster than the P100's, so the GDN and head share never applied; a main card with slower memory
+  than the Pascal card is untested.
 - **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 
 Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the

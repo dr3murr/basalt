@@ -1,3 +1,20 @@
+## This fork: a Tesla P100 (Pascal) expert tier
+
+This is branch `pascal-tier` of [dr3murr/basalt](https://github.com/dr3murr/basalt), a fork of
+[jesdga95/basalt](https://github.com/jesdga95/basalt) at upstream commit `9595ae0`. It lets a Tesla P100 (sm_60) be
+the expert tier beside a Blackwell main card; measured on an RTX 5080 + P100, Qwen3.8-Flash-Next NVFP4 decodes at
+122/201/122 t/s (conv/struct/prose) on Linux against 82/83/80 t/s on the 5080 alone, and at 116/187/112 t/s on
+Windows 11. **Read [PASCAL.md](PASCAL.md)** for how it works, the driver requirements, the build and the numbers with
+their sources; the Windows driver and build kit is in [contrib/windows-p100/](contrib/windows-p100/).
+
+Written with AI coding agents and measured on one machine (RTX 5080 + Tesla P100, Ryzen 9 9950X3D, 64 GB DDR5); not
+reviewed by a kernel/GPU engineer. Use at your own risk. Running the two cards together needs a modified driver setup
+(Linux: proprietary R580 + an undocumented module option; Windows: an INF-edited, re-signed Data Center 582.99
+package); nothing was tested on a stock driver install. Not reviewed by upstream; everything below this section is
+upstream's README.
+
+---
+
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
