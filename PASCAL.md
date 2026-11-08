@@ -13,10 +13,12 @@ This is branch `pascal-tier` of [dr3murr/basalt](https://github.com/dr3murr/basa
 not rebased onto later upstream work. Upstream has not reviewed any of it. Everything specific to this fork is
 described here; the rest of the repository is upstream Basalt.
 
-The fork adds one feature: a Pascal card, here a Tesla P100 16 GB, can be the expert tier next to a Blackwell main
-card (here an RTX 5080 16 GB). Upstream Basalt runs only on sm_120. The P100 holds 15 GiB of experts and computes
-their rows in every decode window with kernels of its own, so the CPU computes far fewer experts. The fork also
-includes a Windows kit that gets both cards running under one driver ([contrib/windows-p100/](contrib/windows-p100/)).
+The *expert tier* is upstream Basalt's mechanism for a second Blackwell card, which Basalt took over from Strata's
+helper caches and peer tier ([Prior art and credits](#prior-art-and-credits)). Upstream Basalt runs only on sm_120
+and stops on any other card. This fork makes the tier run on a Pascal card, here a Tesla P100 16 GB, next to a
+Blackwell main card (here an RTX 5080 16 GB): the P100 holds 15 GiB of experts and computes their rows in every decode
+window with kernels of its own, so the CPU computes far fewer experts. The fork also includes a Windows kit that gets
+both cards running under one driver ([contrib/windows-p100/](contrib/windows-p100/)).
 
 Sources are given in brackets after each number and listed at the end ([Sources](#sources)).
 
@@ -37,6 +39,7 @@ Sources are given in brackets after each number and listed at the end ([Sources]
 - [Reproducing](#reproducing)
 - [Commits](#commits)
 - [Related work](#related-work)
+- [Prior art and credits](#prior-art-and-credits)
 - [Sources](#sources)
 
 ## Results in one table
@@ -277,8 +280,10 @@ Basalt itself needs CUDA 13 for sm_120; the P100's kernels need a CUDA 12.x nvcc
 `BASALT_PASCAL_NVCC` the build has no Pascal kernels, and a run that lists a Pascal card stops with
 `pascal tier: this build has no Pascal kernels (configure with -DBASALT_PASCAL_NVCC=<a CUDA 12 nvcc>)`.
 
-Linux (the configuration of the measured builds; CUDA 12.9's nvcc does not accept GCC 15, hence
-`BASALT_PASCAL_CCBIN`):
+Linux (the configuration of the measured builds: GCC 15.2 as the host compiler, `WERROR` and `BUILD_TESTING` off;
+CUDA 12.9's nvcc does not accept GCC 15, hence `BASALT_PASCAL_CCBIN`). It built branch `p100-peer` (f14e879 +
+b1049ff); this branch adds 086814a and 6e4cc31, which were compiled with MSVC only, so **a Linux build of
+`pascal-tier` has not been re-verified**:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -499,6 +504,8 @@ flags worked only with `ld.acquire.sys`; `ld.global.cv` never saw the update [R]
 - The fp16 kernels round differently from the main card's kernels; results are reproducible run to run only with the
   expert cache pinned (`--expert-cache N`) and the same expert placement [R].
 - Upstream Basalt has moved on since `9595ae0`; this branch has not been rebased or reviewed upstream.
+- A Linux (GCC) build of this branch has not been re-verified; Linux built `p100-peer`, Windows (MSVC) built this
+  branch ([Building](#building)).
 
 ## Reproducing
 
@@ -549,7 +556,9 @@ On top of upstream `9595ae0`, oldest first:
 | 375135f | auto plan: peer-exclusive with a Pascal tier whenever the full set does not fit (cherry-pick of b1049ff) |
 
 The other two branches of the fork hold the same work unmerged: `p100-peer` (f14e879 + b1049ff, what the Linux
-machine ran) and `windows-build` (f14e879 + 086814a + 6e4cc31).
+machine ran) and `windows-build` (f14e879 + 086814a + 6e4cc31). `p100-peer` still has the GCC-only
+`__attribute__((target(...)))` in `src/core/peer_experts.cpp` that upstream's `tools/check_platform_boundary.sh`
+rejects; 086814a replaces it in the other two branches.
 
 ## Related work
 
@@ -559,6 +568,26 @@ machine ran) and `windows-build` (f14e879 + 086814a + 6e4cc31).
   [QWEN38_27B.md](https://github.com/dr3murr/llama.cpp/blob/qwen38-27b-p100/QWEN38_27B.md) (branch `qwen38-27b-p100`).
 - P2P between the RTX 5080 and the P100 on Linux (not used by Basalt):
   [P2P_P100_RTX50.md](https://github.com/dr3murr/open-gpu-kernel-modules/blob/p100-rtx50-p2p-580.173.02/P2P_P100_RTX50.md).
+
+## Prior art and credits
+
+- **The expert tier** is upstream Basalt's: every card after the main one holds and computes experts, and the start
+  line `multi-gpu: ... ms per window: expert tier ..., layer split ...; picked expert tier` with the rule that unlike
+  cards always use the expert tier is upstream code ([docs/configuration/gpus.md](docs/configuration/gpus.md),
+  [upstream](https://github.com/jesdga95/basalt/blob/main/docs/configuration/gpus.md)). Basalt took it over from
+  [Strata](https://github.com/Niko1221/Strata)'s helper caches and peer tier
+  ([SECOND_GPU.md](https://github.com/Niko1221/Strata/blob/main/docs/SECOND_GPU.md)), where a Tesla P100 already ran
+  as a helper card next to a V100 ([Strata #1079](https://github.com/Niko1221/Strata/issues/1079),
+  [#1452](https://github.com/Niko1221/Strata/pull/1452)).
+- **NVFP4 on non-Blackwell cards** was done before in software by Strata's decode kernels, benchmarked on a Tesla
+  P100 ([NVFP4.md](https://github.com/Niko1221/Strata/blob/main/docs/NVFP4.md)).
+- **The fp16 approach** of the Pascal kernel follows the GP100 path of the llama.cpp fork
+  ([P100.md](https://github.com/dr3murr/llama.cpp/blob/p100-qr0n/P100.md)), whose mat-vec kernels build on
+  [qr0n/p100-llama-cpp](https://github.com/qr0n/p100-llama-cpp).
+- **What this fork adds:** the tier running on a Pascal card inside Basalt's sm_120, CUDA 13 engine (a separate
+  CUDA 12.9 cubin, NVFP4 decoded into fp16 math, inputs from mapped host memory), the plan and swap-round changes for
+  a narrow link, the peer-exclusive rule for such a tier, the Windows swap staging, and the measurements. Credits for
+  the Windows driver setup are in [contrib/windows-p100/README.md](contrib/windows-p100/README.md#credits-and-prior-art).
 
 ## Sources
 

@@ -222,6 +222,26 @@ On the test machine 61 of 63 CPU tests pass:
 - `platform_system_test` fails `keep_full_speed` because power throttling is off system-wide on that machine
   (`PowerThrottlingOff = 1`), so Windows rejects the per-process opt-out with `ERROR_INVALID_FUNCTION`.
 
+## Credits and prior art
+
+- **Signing method:** [NVCleanstall](https://www.techpowerup.com/download/techpowerup-nvcleanstall/) (TechPowerUp):
+  an edited INF, a catalog re-signed with a fresh self-signed certificate trusted in LocalMachine Root and
+  TrustedPublisher, the binaries keeping NVIDIA's signatures, and the INF-only catalog of its Easy-Anti-Cheat mode.
+  The kit's scripts reimplement that method from a static analysis of NVCleanstall 1.19.0.
+- **The same INF idea for GeForce + Tesla:** [Z0ntiQ/nv-dual-gpu-driver-patch](https://github.com/Z0ntiQ/nv-dual-gpu-driver-patch)
+  adds a GeForce device ID to a same-chip donor section of the Data Center INF and re-signs the catalog (verified there
+  with a V100 + RTX 2060 on 582.78); unlike this kit it turns test-signing on for the install.
+- **The Tesla registry keys** step 3b writes (`AdapterType`, `GridLicensedFeatures = 7`, `EnableMsHybrid = 1`,
+  `AllowWddmOnTesla`) come from the community: the Level1Techs thread
+  ["Gaming on my Tesla"](https://forum.level1techs.com/t/gaming-on-my-tesla-more-likely-than-you-think/171185) and
+  [TeslaP40_wddm](https://github.com/Ilan12346-maya/TeslaP40_wddm) (whose `enable_wddm.bat` writes them).
+- **MCDM on a Pascal Tesla** was documented before for a Tesla P40 under WSL2:
+  [schmared/tesla-p40-wsl2-cuda-llamacpp](https://github.com/schmared/tesla-p40-wsl2-cuda-llamacpp) (it switches with
+  `nvidia-smi -dm 2`; whether the extra keys 3b writes are needed for MCDM was not tested here).
+- Not found in earlier public write-ups (searched 2026-11-08): an RTX 50 card and a Pascal Tesla on one package with
+  no test-signing at any step, and the cause of the P100's TCC Code 10 next to `DmaRemappingCompatible = 3`
+  ([DIAGNOSIS.md](DIAGNOSIS.md)).
+
 ## Files
 
 Run on the test machine (2026-11-04/05) in the form they had then, with paths fixed to that machine; for publication
