@@ -307,8 +307,10 @@ ctest --test-dir build -L cpu -j 8 --output-on-failure
 
 On Windows 61 of 63 CPU tests pass; `iq_avx512_test` (MSVC's float results differ from hashes frozen from a GCC
 build in the last bits) and `platform_system_test` (`keep_full_speed`, refused when power throttling is off
-system-wide) fail on the test machine [K]. Everything lands in `bin/` (`basalt`, `basalt-bench`, `basalt-probe`,
-`basalt-vision`).
+system-wide) fail on the test machine [K]. A fresh clone of this branch, built on 2026-11-08 with the kit's
+`6_build_basalt.ps1` and no Python with numpy at configure time (which leaves three Python-dependent tests
+unregistered), passed 58 of 60 CPU tests with the same two failures; `auto_plan_test` passed. Everything lands in
+`bin/` (`basalt`, `basalt-bench`, `basalt-probe`, `basalt-vision`).
 
 ## Running
 

@@ -222,6 +222,12 @@ On the test machine 61 of 63 CPU tests pass:
 - `platform_system_test` fails `keep_full_speed` because power throttling is off system-wide on that machine
   (`PowerThrottlingOff = 1`), so Windows rejects the per-process opt-out with `ERROR_INVALID_FUNCTION`.
 
+How many tests are registered depends on Python: with a Python 3 that has numpy and gguf-py at configure time (the
+test machine's checkout has numpy in its `.venv`), 63 CPU tests are registered. Without it `iq_parity_fixtures`,
+`iq_parity` and `convert_tests` are left out: a fresh clone of this branch built on 2026-11-08 with
+`6_build_basalt.ps1 -Jobs 4 -TestJobs 2` (MSVC 19.44.35228, CUDA 13.3.73, the cubin from CUDA 12.9) registered 60
+CPU tests, passed 58 and failed the same two; `auto_plan_test`, which covers b1049ff's rule, passed.
+
 ## Credits and prior art
 
 - **Signing method:** [NVCleanstall](https://www.techpowerup.com/download/techpowerup-nvcleanstall/) (TechPowerUp):
