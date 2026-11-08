@@ -281,9 +281,9 @@ Basalt itself needs CUDA 13 for sm_120; the P100's kernels need a CUDA 12.x nvcc
 `pascal tier: this build has no Pascal kernels (configure with -DBASALT_PASCAL_NVCC=<a CUDA 12 nvcc>)`.
 
 Linux (the configuration of the measured builds: GCC 15.2 as the host compiler, `WERROR` and `BUILD_TESTING` off;
-CUDA 12.9's nvcc does not accept GCC 15, hence `BASALT_PASCAL_CCBIN`). It built branch `p100-peer` (f14e879 +
-b1049ff); this branch adds 086814a and 6e4cc31, which were compiled with MSVC only, so **a Linux build of
-`pascal-tier` has not been re-verified**:
+CUDA 12.9's nvcc does not accept GCC 15, hence `BASALT_PASCAL_CCBIN`). These were builds of branch `p100-peer`
+(f14e879 + b1049ff); this branch adds 086814a and 6e4cc31, which were first compiled with MSVC. Its own Linux check is
+described after the command:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -292,6 +292,24 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     -DBASALT_PASCAL_CCBIN=/usr/bin/g++-14
 cmake --build build -j
 ```
+
+**Linux check of this branch (2026-11-08): compiled, CPU tests only.** A fresh clone of commit 3320e3e was built in
+WSL2 (Ubuntu 24.04) with GCC 13.3, CUDA 13.4 for sm_120 and CUDA 12.9's nvcc for the cubin
+(`-DBASALT_PASCAL_NVCC=<12.9 nvcc> -DBASALT_PASCAL_CCBIN=/usr/bin/g++-13`), with the options of upstream's Linux CI job
+(`-G Ninja -DWERROR=ON -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES=120`, Python 3.12 with `requirements.txt`):
+
+- All 630 build steps succeeded. No compiler warnings in the project's sources; CUDA 12.9's nvcc printed two for the
+  cubin (#177-D: the `NS` members of `Fmt<kIQ4_NL>` and `Fmt<kQ2_0>` are never referenced), which `WERROR` does not
+  cover.
+- `ctest -L cpu` with every GPU hidden (`CUDA_VISIBLE_DEVICES=-1`): 68 of 68 passed, including `auto_plan_test` and
+  the two AVX-512 tests.
+- CI's other checks passed: every test has a `cpu` or `gpu` label, `tools/check_isa_isolation.py`, and the lint job
+  (`tools/check_platform_boundary.sh`, `tools/check_stderr_logging.sh`, and the server, tool, converter and migration
+  Python tests).
+
+Not checked on Linux: anything that runs on a GPU (the `gpu`-labelled tests, the Pascal kernels, the benchmarks).
+Under WSL the cards run on the Windows driver, not the Linux setup above, and they were in use by other work. GCC 15.2
+and CUDA 13.3, the compilers of the measured builds, were not used for this check.
 
 Windows: MSVC v143 (19.44) from a Visual Studio developer shell, Ninja, CUDA 13.3 and CUDA 12.9 (the 12.9 nvcc only
 for the cubin); `contrib/windows-p100/scripts/5_install_toolchain.ps1` installs the parts and `6_build_basalt.ps1`
@@ -506,8 +524,8 @@ flags worked only with `ld.acquire.sys`; `ld.global.cv` never saw the update [R]
 - The fp16 kernels round differently from the main card's kernels; results are reproducible run to run only with the
   expert cache pinned (`--expert-cache N`) and the same expert placement [R].
 - Upstream Basalt has moved on since `9595ae0`; this branch has not been rebased or reviewed upstream.
-- A Linux (GCC) build of this branch has not been re-verified; Linux built `p100-peer`, Windows (MSVC) built this
-  branch ([Building](#building)).
+- On Linux this branch was only compiled and CPU-tested (2026-11-08, GCC 13.3 in WSL2; [Building](#building)); it was
+  not run on the GPUs under Linux. The Linux numbers come from builds of `p100-peer`.
 
 ## Reproducing
 
@@ -560,7 +578,8 @@ On top of upstream `9595ae0`, oldest first:
 The other two branches of the fork hold the same work unmerged: `p100-peer` (f14e879 + b1049ff, what the Linux
 machine ran) and `windows-build` (f14e879 + 086814a + 6e4cc31). `p100-peer` still has the GCC-only
 `__attribute__((target(...)))` in `src/core/peer_experts.cpp` that upstream's `tools/check_platform_boundary.sh`
-rejects; 086814a replaces it in the other two branches.
+rejects (on 2026-11-08 it failed on `p100-peer` and passed on this branch); 086814a replaces it in the other two
+branches.
 
 ## Related work
 
